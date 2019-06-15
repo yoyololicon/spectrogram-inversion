@@ -107,18 +107,21 @@ def griffin_lim(spec, maxiter=1000, tol=1e-6, verbose=1, evaiter=10, hop_length=
     if window is None:
         coeff = hop_length / win_length
     else:
-        coeff = hop_length / window.sum()
+        coeff = hop_length / window.pow(2).sum()
+        win_length = len(window)
 
-    conv_weight = torch.eye(n_fft, dtype=dtype, device=device).unsqueeze(1)
+    offset = (n_fft - win_length) // 2
+    conv_weight = torch.eye(win_length, dtype=dtype, device=device).unsqueeze(1)
 
     def istft(x):
         x = torch.irfft(x.transpose(0, 1), 1, normalized=normalized, onesided=onesided,
-                        signal_sizes=[n_fft] if onesided else None)
-        x *= coeff
+                        signal_sizes=[n_fft] if onesided else None)[:, offset:offset + win_length] * coeff
+        if window is not None:
+            x *= window
         x = x.t().unsqueeze(0)
         x = F.conv_transpose1d(x, conv_weight, stride=hop_length).view(-1)
         if center:
-            x = x[n_fft // 2:-n_fft // 2]
+            x = x[win_length // 2:-win_length // 2]
         return x
 
     new_spec = torch.stack((spec, torch.zeros_like(spec)), -1)
@@ -191,7 +194,7 @@ def RTISI_LA(spec, look_ahead=3, maxiter=25, verbose=1, hop_length=None, win_len
     if window is None:
         coeff = hop_length / win_length
     else:
-        coeff = hop_length / window.sum()
+        coeff = hop_length / window.pow(2).sum()
         win_length = len(window)
 
     offset = (n_fft - win_length) // 2
@@ -206,13 +209,15 @@ def RTISI_LA(spec, look_ahead=3, maxiter=25, verbose=1, hop_length=None, win_len
         return torch.irfft(x, 1, normalized=normalized, onesided=onesided, signal_sizes=[n_fft] if onesided else None)
 
     def transpose_conv(x):
+        if window is not None:
+            x = x * window[:, None]
         return F.conv_transpose1d((x * coeff).unsqueeze(0), conv_weight, stride=hop_length).view(-1)
 
     # initialize first frame with zero phase
     first_frame = spec[:, look_ahead]
     xt[:, num_keep + look_ahead] = irfft(torch.stack((first_frame, torch.zeros_like(first_frame)), -1))
 
-    with tqdm(total=steps, disable=not verbose) as pbar:
+    with tqdm(total=steps + look_ahead, disable=not verbose) as pbar:
         for i in range(steps + look_ahead):
             for _ in range(maxiter):
                 x = transpose_conv(xt[offset:offset + win_length, i:i + num_keep + look_ahead + 1])
@@ -248,7 +253,7 @@ if __name__ == '__main__':
         return torch.stft(x, *args, **kwargs).pow(2).sum(2).add_(1e-7).pow(p / 2)
 
 
-    func = partial(spectrogram, p=1, n_fft=1024, window=window, hop_length=128)
+    func = partial(spectrogram, p=1, n_fft=1024, window=window, hop_length=326)
 
     spec = func(y)
     # mag = spec.pow(0.5).cpu().numpy()
@@ -258,9 +263,9 @@ if __name__ == '__main__':
     display.specshow(spec.cpu().numpy(), y_axis='log')
     plt.show()
 
-    #estimated = L_BFGS(spec, func, len(y), maxiter=20, lr=1, history_size=10, evaiter=5)
-    #estimated = griffin_lim(spec, window=window, maxiter=1000, tol=0, hop_length=512)
-    estimated = RTISI_LA(spec, window=window, maxiter=12, look_ahead=3, hop_length=128)
+    #estimated = L_BFGS(spec, func, len(y), maxiter=50, lr=1, history_size=10, evaiter=5)
+    estimated = griffin_lim(spec, window=window, maxiter=200, hop_length=326)
+    #estimated = RTISI_LA(spec, window=window, maxiter=12, look_ahead=3, hop_length=326)
     estimated_spec = func(estimated)
     display.specshow(estimated_spec.cpu().numpy(), y_axis='log')
     plt.show()
