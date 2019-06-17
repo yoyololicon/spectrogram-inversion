@@ -5,7 +5,7 @@ from torch.optim.lbfgs import LBFGS
 from tqdm import tqdm
 from functools import partial
 
-from metrics import spectral_convergence, SNR
+from metrics import spectral_convergence, SNR, SER
 
 
 def L_BFGS(spec, transform_fn, samples=None, init_x0=None, maxiter=1000, tol=1e-6, verbose=1, evaiter=10, **kwargs):
@@ -155,7 +155,7 @@ def griffin_lim(spec, maxiter=1000, tol=1e-6, verbose=1, evaiter=10, hop_length=
 
 
 @torch.no_grad()
-def RTISI_LA(spec, look_ahead=3, maxiter=25, verbose=1, hop_length=None, win_length=None,
+def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, maxiter=25, verbose=1, hop_length=None, win_length=None,
              window=None, center=True, pad_mode='reflect', normalized=False, onesided=True):
     """
     Paper: http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.420.3256&rep=rep1&type=pdf
@@ -199,39 +199,66 @@ def RTISI_LA(spec, look_ahead=3, maxiter=25, verbose=1, hop_length=None, win_len
 
     offset = (n_fft - win_length) // 2
     conv_weight = torch.eye(win_length, dtype=dtype, device=device).unsqueeze(1)
-    num_keep = win_length // hop_length
+    num_keep = (win_length - 1) // hop_length
+    if look_ahead < 0:
+        look_ahead = num_keep
+
+    asym_window1 = spec.new_zeros(win_length)
+    for i in range(num_keep):
+        asym_window1[(i + 1) * hop_length:] += window.flip(0)[:-(i + 1) * hop_length:]
+    asym_window1 = asym_window1 / coeff
+
+    asym_window2 = spec.new_zeros(win_length)
+    for i in range(num_keep + 1):
+        asym_window2[i * hop_length:] += window.flip(0)[:-i * hop_length if i else None]
+    asym_window2 = asym_window2 / coeff
 
     steps = spec.shape[1]
-    xt = spec.new_zeros(n_fft, steps + num_keep + 2 * look_ahead)
+    xt = spec.new_zeros(steps + num_keep + 2 * look_ahead, n_fft)
+    xt_winview = xt[:, offset:offset + win_length]
     spec = F.pad(spec, [look_ahead, look_ahead])
 
     def irfft(x):
         return torch.irfft(x, 1, normalized=normalized, onesided=onesided, signal_sizes=[n_fft] if onesided else None)
 
+    def rfft(x):
+        return torch.rfft(x, 1, normalized=normalized, onesided=onesided)
+
     def transpose_conv(x):
         if window is not None:
-            x = x * window[:, None]
+            x = x * window.unsqueeze(-1)
         return F.conv_transpose1d((x * coeff).unsqueeze(0), conv_weight, stride=hop_length).view(-1)
 
     # initialize first frame with zero phase
     first_frame = spec[:, look_ahead]
-    xt[:, num_keep + look_ahead] = irfft(torch.stack((first_frame, torch.zeros_like(first_frame)), -1))
+    xt[num_keep + look_ahead] = irfft(torch.stack((first_frame, torch.zeros_like(first_frame)), -1))
 
     with tqdm(total=steps + look_ahead, disable=not verbose) as pbar:
         for i in range(steps + look_ahead):
-            for _ in range(maxiter):
-                x = transpose_conv(xt[offset:offset + win_length, i:i + num_keep + look_ahead + 1])
-                new_spec = torch.stft(x[num_keep * hop_length:(num_keep + look_ahead) * hop_length + win_length],
-                                      n_fft=n_fft, hop_length=hop_length, win_length=win_length, window=window,
-                                      center=False, pad_mode=pad_mode, normalized=normalized, onesided=onesided)
+            for j in range(maxiter):
+                x = transpose_conv(xt_winview[i:i + num_keep + look_ahead + 1].t())
+                if asymmetric_window:
+                    xt_winview[i + num_keep:i + num_keep + look_ahead + 1] = \
+                        x.unfold(0, win_length, hop_length)[num_keep:]
 
+                    xt_winview[i + num_keep:i + num_keep + look_ahead] *= window
+                    if j:
+                        xt_winview[i + num_keep + look_ahead] *= asym_window2
+                    else:
+                        xt_winview[i + num_keep + look_ahead] *= asym_window1
+
+                    new_spec = rfft(xt[i + num_keep:i + num_keep + look_ahead + 1]).transpose(0, 1)
+                else:
+                    new_spec = torch.stft(x[num_keep * hop_length:(num_keep + look_ahead) * hop_length + win_length],
+                                          n_fft=n_fft, hop_length=hop_length, win_length=win_length, window=window,
+                                          center=False, pad_mode=pad_mode, normalized=normalized, onesided=onesided)
                 mag = F.threshold_(new_spec.pow(2).sum(2).sqrt(), 1e-7, 1e-7)
                 new_spec *= (spec[:, i:i + look_ahead + 1] / mag).unsqueeze(-1)
-                xt[:, i + num_keep:i + num_keep + look_ahead + 1] = irfft(new_spec.transpose(0, 1)).t()
+                xt[i + num_keep:i + num_keep + look_ahead + 1] = irfft(new_spec.transpose(0, 1))
 
             pbar.update()
 
-    x = transpose_conv(xt[offset:offset + win_length, num_keep + look_ahead:-look_ahead if look_ahead else None])
+    x = transpose_conv(xt_winview[num_keep + look_ahead:-look_ahead if look_ahead else None].t())
     if center:
         x = x[win_length // 2:-win_length // 2]
 
@@ -243,33 +270,31 @@ if __name__ == '__main__':
     from librosa import display
     import matplotlib.pyplot as plt
 
-    y, sr = librosa.load(librosa.util.example_audio_file())
-    librosa.output.write_wav('origin.wav', y, sr)
+    y, sr = librosa.load(librosa.util.example_audio_file(), duration=20)
+    # librosa.output.write_wav('origin.wav', y, sr)
     y = torch.Tensor(y).cuda()
-    window = torch.hann_window(1024).cuda()
+    window = torch.blackman_window(1024).cuda()
 
 
     def spectrogram(x, *args, p=1, **kwargs):
         return torch.stft(x, *args, **kwargs).pow(2).sum(2).add_(1e-7).pow(p / 2)
 
 
-    func = partial(spectrogram, p=1, n_fft=1024, window=window, hop_length=326)
+    func = partial(spectrogram, p=1, n_fft=1024, window=window)
 
     spec = func(y)
     # mag = spec.pow(0.5).cpu().numpy()
     # phase = np.random.uniform(-np.pi, np.pi, mag.shape)
     # _, init_x = istft(mag * np.exp(1j * phase), noverlap=1024 - 256)
 
-    display.specshow(spec.cpu().numpy(), y_axis='log')
-    plt.show()
-
-    #estimated = L_BFGS(spec, func, len(y), maxiter=50, lr=1, history_size=10, evaiter=5)
-    estimated = griffin_lim(spec, window=window, maxiter=200, hop_length=326)
-    #estimated = RTISI_LA(spec, window=window, maxiter=12, look_ahead=3, hop_length=326)
+    # estimated = L_BFGS(spec, func, len(y), maxiter=50, lr=1, history_size=10, evaiter=5)
+    # estimated = griffin_lim(spec, maxiter=200, window=window)
+    estimated = RTISI_LA(spec, maxiter=20, look_ahead=3, asymmetric_window=True, window=window)
     estimated_spec = func(estimated)
     display.specshow(estimated_spec.cpu().numpy(), y_axis='log')
     plt.show()
 
-    print(SNR(estimated_spec, spec).item())
+    print(SNR(estimated_spec, spec).item(), spectral_convergence(estimated_spec, spec).item(),
+          SER(estimated_spec, spec).item())
 
     librosa.output.write_wav('test.wav', estimated.cpu().numpy(), sr)

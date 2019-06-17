@@ -7,3 +7,7 @@ def spectral_convergence(input, target):
 
 def SNR(input, target):
     return -10 * (input / input.norm() - target / target.norm()).pow(2).sum().log10()
+
+
+def SER(input, target):
+    return 10 * (input.pow(2).sum().log10() - (input - target).pow(2).sum().log10())
