@@ -105,35 +105,28 @@ def SPSI(spec, **kwargs):
 
     def peak_picking(x):
         mask = (x[1:-1] > x[2:]) & (x[1:-1] > x[:-2])
-        return F.pad(mask, (0, 0, 1, 1))
+        return F.pad(mask, [0, 0, 1, 1])
 
-    L, N = spec.shape
-    for m in tqdm(range(N)):
-        trough = 0
-        for j in range(1, L - 1):
-            if spec[j, m] > spec[j - 1, m] and spec[j, m] > spec[j + 1, m]:
-                a, b, r = spec[j - 1:j + 2, m]
-                p = 0.5 * (a - r) / (a - 2 * b + r)
-                omega = pi2 * (j + p) / n_fft
-                if m:
-                    phase[j, m] = phase[j, m - 1] + hop_length * omega
-                else:
-                    phase[j, m] = hop_length * omega
+    mask = peak_picking(spec)
+    b = torch.masked_select(spec, mask)
+    a = torch.masked_select(spec[:-1], mask[1:])
+    r = torch.masked_select(spec[1:], mask[:-1])
+    b_peaks = torch.nonzero(mask).t()
+    p = 0.5 * (a - r) / (a - 2 * b + r)
+    omega = pi2 * (b_peaks[0].float() + p) / n_fft * hop_length
+    pi_shift = p > 0
 
-                if p > 0:
-                    rphase = omega
-                    lphase = omega + np.pi
-                else:
-                    lphase = omega
-                    rphase = omega + np.pi
+    def unwarp(x):
+        x %= pi2
+        return torch.where(x > np.pi, x - pi2, x)
 
-                j = int(j + 0.5 + p)
-                phase[trough:j, m] = lphase
-                phase[j, m] = rphase
-                while spec[j + 1, m] < spec[j, m] and j < L - 2:
-                    j += 1
-                    phase[j, m] = rphase
-                trough = j + 1
+    idx1, idx2 = b_peaks.unbind()
+    phase[idx1, idx2] = omega
+    phase[idx1 - 1, idx2] = omega
+    phase[idx1 + 1, idx2] = omega
+
+    phase = torch.cumsum(phase, 1, out=phase)
+    # phase = unwarp(phase)
 
     x = torch.stack((torch.cos(phase), torch.sin(phase)), 2) * spec.unsqueeze(2)
     x = torch.irfft(x.transpose(0, 1), 1, normalized=normalized, onesided=onesided,
@@ -149,7 +142,7 @@ def SPSI(spec, **kwargs):
 
 
 @torch.no_grad()
-def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, verbose=1, evaiter=10, **kwargs):
+def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, decay=False, gamma=1.3, verbose=1, evaiter=10, **kwargs):
     """
     Paper: https://pdfs.semanticscholar.org/14bc/876fae55faf5669beb01667a4f3bd324a4f1.pdf
 
@@ -213,20 +206,22 @@ def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, verbose=1, evaiter=10, **kwargs)
             x = x[win_length // 2:-win_length // 2]
         return x
 
-    X = torch.stack((spec, torch.zeros_like(spec)), -1)
-    x = istft(X)
+    x = SPSI(spec, **kwargs)
+    X = torch.stft(x, n_fft, **kwargs)
+    #X = torch.stack((spec, torch.zeros_like(spec)), -1)
+    #x = istft(X)
     Z = X.clone()
     Y = X.clone()
     U = torch.zeros_like(X)
+    if decay:
+        rho = torch.linspace(rho ** (1 / gamma), 1, maxiter) ** gamma
+    else:
+        rho = torch.ones(maxiter) * rho
 
     criterion = nn.MSELoss()
     init_loss = None
     with tqdm(total=maxiter, disable=not verbose) as pbar:
         for i in range(maxiter):
-            reconstruted = torch.stft(x, n_fft, **kwargs)
-            Z[:] = (rho * Y + reconstruted) / (1 + rho)
-            U += X - Z
-
             # Pc2
             X[:] = Z - U
             mag = X.pow(2).sum(2).sqrt()
@@ -235,6 +230,10 @@ def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, verbose=1, evaiter=10, **kwargs)
             Y[:] = X + U
             # Pc1
             x[:] = istft(Y)
+            reconstruted = torch.stft(x, n_fft, **kwargs)
+
+            Z[:] = (rho[i] * Y + reconstruted) / (1 + rho[i])
+            U += X - Z
 
             if i % evaiter == evaiter - 1:
                 mag = reconstruted.pow(2).sum(2).sqrt()
@@ -251,7 +250,7 @@ def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, verbose=1, evaiter=10, **kwargs)
                     break
                 previous_loss = l2_loss
 
-    return x
+    return istft(X)
 
 
 @torch.no_grad()
@@ -321,7 +320,8 @@ def griffin_lim(spec, maxiter=1000, tol=1e-6, alpha=0.99, verbose=1, evaiter=10,
 
     new_spec = torch.stack((spec, torch.zeros_like(spec)), -1)
     pre_spec = new_spec.clone()
-    x = istft(new_spec)
+    # x = istft(new_spec)
+    x = SPSI(spec, **kwargs)
 
     criterion = nn.MSELoss()
     init_loss = None
@@ -483,9 +483,9 @@ if __name__ == '__main__':
 
     nfft = 1024
     winsize = 1024
-    hopsize = 256
+    hopsize = 128
 
-    y, sr = librosa.load(librosa.util.example_audio_file())
+    y, sr = librosa.load(librosa.util.example_audio_file(), duration=30)
     # librosa.output.write_wav('origin.wav', y, sr)
     y = torch.Tensor(y).cuda()
     window = torch.hann_window(winsize).cuda()
@@ -499,7 +499,7 @@ if __name__ == '__main__':
         'win_length': winsize,
         'window': window,
         'hop_length': hopsize,
-        'pad_mode': 'constant',
+        'pad_mode': 'reflect',
         'onesided': True,
         'normalized': False,
         'center': True
@@ -512,11 +512,11 @@ if __name__ == '__main__':
     # _, init_x = istft(mag * np.exp(1j * phase), noverlap=1024 - 256)
 
     # estimated = L_BFGS(spec, func, len(y), maxiter=50, lr=1, history_size=10, evaiter=5)
-    #estimated = griffin_lim(spec, maxiter=500, alpha=0.95, **arg_dict)
-    #estimated = ADMM(spec, maxiter=500, rho=0.3, tol=0, **arg_dict)
+    estimated = griffin_lim(spec, maxiter=100, alpha=0.3, **arg_dict)
+    #estimated = ADMM(spec, maxiter=1000, rho=0., tol=0, decay=True, gamma=3, **arg_dict)
     # arg_dict['hop_length'] = 333
-    estimated = RTISI_LA(spec, maxiter=20, look_ahead=3, asymmetric_window=True, **arg_dict)
-    # estimated = SPSI(spec, **arg_dict)
+    #estimated = RTISI_LA(spec, maxiter=4, look_ahead=3, asymmetric_window=True, **arg_dict)
+    #estimated = SPSI(spec, **arg_dict)
     estimated_spec = spectrogram(estimated, nfft, **arg_dict)
     display.specshow(librosa.amplitude_to_db(estimated_spec.cpu().numpy(), ref=np.max), y_axis='log')
     plt.show()
