@@ -4,6 +4,9 @@ import torch.nn.functional as F
 from torch.optim.lbfgs import LBFGS
 from tqdm import tqdm
 from functools import partial
+import numpy as np
+
+pi2 = 2 * np.pi
 
 from metrics import spectral_convergence, SNR, SER
 
@@ -67,7 +70,7 @@ def L_BFGS(spec, transform_fn, samples=None, init_x0=None, maxiter=1000, tol=1e-
 
 
 @torch.no_grad()
-def griffin_lim(spec, maxiter=1000, tol=1e-6, verbose=1, evaiter=10, **kwargs):
+def griffin_lim(spec, maxiter=1000, tol=1e-6, alpha=0.99, verbose=1, evaiter=10, **kwargs):
     """
     Paper: https://pdfs.semanticscholar.org/14bc/876fae55faf5669beb01667a4f3bd324a4f1.pdf
 
@@ -132,6 +135,7 @@ def griffin_lim(spec, maxiter=1000, tol=1e-6, verbose=1, evaiter=10, **kwargs):
         return x
 
     new_spec = torch.stack((spec, torch.zeros_like(spec)), -1)
+    pre_spec = new_spec.clone()
     x = istft(new_spec)
 
     criterion = nn.MSELoss()
@@ -139,6 +143,8 @@ def griffin_lim(spec, maxiter=1000, tol=1e-6, verbose=1, evaiter=10, **kwargs):
     with tqdm(total=maxiter, disable=not verbose) as pbar:
         for i in range(maxiter):
             new_spec[:] = torch.stft(x, n_fft, **kwargs)
+            new_spec += alpha * (new_spec - pre_spec)
+            pre_spec.copy_(new_spec)
 
             mag = new_spec.pow(2).sum(2).sqrt()
             new_spec *= (spec / F.threshold_(mag, 1e-7, 1e-7)).unsqueeze(-1)
@@ -154,7 +160,7 @@ def griffin_lim(spec, maxiter=1000, tol=1e-6, verbose=1, evaiter=10, **kwargs):
 
                 if not init_loss:
                     init_loss = l2_loss
-                elif (previous_loss - l2_loss) / init_loss < tol * evaiter:
+                elif (previous_loss - l2_loss) / init_loss < tol * evaiter and not alpha:
                     break
                 previous_loss = l2_loss
 
@@ -162,8 +168,8 @@ def griffin_lim(spec, maxiter=1000, tol=1e-6, verbose=1, evaiter=10, **kwargs):
 
 
 @torch.no_grad()
-def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, maxiter=25, verbose=1, hop_length=None, win_length=None,
-             window=None, center=True, pad_mode='reflect', normalized=False, onesided=True):
+def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, maxiter=25, alpha=0.9, verbose=1, hop_length=None,
+             win_length=None, window=None, center=True, pad_mode='reflect', normalized=False, onesided=True):
     """
     Paper: http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.420.3256&rep=rep1&type=pdf
 
@@ -260,8 +266,16 @@ def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, maxiter=25, verbose=1
                     new_spec = torch.stft(F.pad(x[num_keep * hop_length - offset:], [0, offset]),
                                           n_fft=n_fft, hop_length=hop_length, win_length=win_length, window=window,
                                           center=False, pad_mode=pad_mode, normalized=normalized, onesided=onesided)
+
+                if j or j:
+                    new_spec += alpha * (new_spec - pre_spec)
+                    pre_spec.copy_(new_spec)
+                else:
+                    pre_spec = new_spec.clone()
+
                 mag = F.threshold_(new_spec.pow(2).sum(2).sqrt(), 1e-7, 1e-7)
                 new_spec *= (spec[:, i:i + look_ahead + 1] / mag).unsqueeze(-1)
+
                 xt_winview[i + num_keep:i + num_keep + look_ahead + 1] = irfft(new_spec.transpose(0, 1))[:,
                                                                          offset:offset + win_length]
 
@@ -283,7 +297,7 @@ if __name__ == '__main__':
     import numpy as np
 
     nfft = 2048
-    winsize = 1024
+    winsize = 2048
     hopsize = 256
 
     y, sr = librosa.load(librosa.util.example_audio_file(), duration=20)
@@ -300,10 +314,10 @@ if __name__ == '__main__':
         'win_length': winsize,
         'window': window,
         'hop_length': hopsize,
-        'pad_mode': 'replicate',
+        'pad_mode': 'constant',
         'onesided': True,
-        'normalized': True,
-        'center': False
+        'normalized': False,
+        'center': True
     }
 
     spec = spectrogram(y, nfft, **arg_dict)
@@ -313,8 +327,9 @@ if __name__ == '__main__':
     # _, init_x = istft(mag * np.exp(1j * phase), noverlap=1024 - 256)
 
     # estimated = L_BFGS(spec, func, len(y), maxiter=50, lr=1, history_size=10, evaiter=5)
-    #estimated = griffin_lim(spec, maxiter=200, **arg_dict)
-    estimated = RTISI_LA(spec, maxiter=4, look_ahead=3, asymmetric_window=True, **arg_dict)
+    # estimated = griffin_lim(spec, maxiter=500, **arg_dict)
+    # arg_dict['hop_length'] = 333
+    estimated = RTISI_LA(spec, maxiter=8, look_ahead=-1, asymmetric_window=True, **arg_dict)
     estimated_spec = spectrogram(estimated, nfft, **arg_dict)
     display.specshow(librosa.amplitude_to_db(estimated_spec.cpu().numpy(), ref=np.max), y_axis='log')
     plt.show()
@@ -322,4 +337,4 @@ if __name__ == '__main__':
     print(SNR(estimated_spec, spec).item(), SER(estimated_spec, spec).item(),
           spectral_convergence(estimated_spec, spec).item())
 
-    # librosa.output.write_wav('test.wav', estimated.cpu().numpy(), sr)
+    librosa.output.write_wav('test.wav', estimated.cpu().numpy(), sr)
