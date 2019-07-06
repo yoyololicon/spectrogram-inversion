@@ -2,7 +2,7 @@ import torch
 
 
 def spectral_convergence(input, target):
-    return 10 * ((input - target).norm().log10() - target.norm().log10())
+    return 20 * ((input - target).norm().log10() - target.norm().log10())
 
 
 def SNR(input, target):
