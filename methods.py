@@ -13,7 +13,19 @@ pi2 = 2 * np.pi
 from metrics import spectral_convergence, SNR, SER
 
 
-def _args_helper(spec, **stft_kwargs):
+def _args_helper(spec: torch.Tensor, **stft_kwargs) -> (int, dict):
+    """A helper function to get stft arguments from the provided kwargs.
+
+    Args:
+        spec: The magnitude spectrum of size (freq x time).
+        **stft_kwargs: Keyword arguments that computed spec from 'torch.stft'.
+        See `torch.stft` for details.
+
+    Returns:
+        n_fft: FFT size of the spectrum.
+        processed_kwargs: Dict object that stored the processed keyword arguments.
+
+    """
     device = spec.device
     dtype = spec.dtype
     args_dict = {'win_length': None, 'window': None, 'hop_length': None, 'center': True, 'normalized': False,
@@ -52,13 +64,30 @@ def _args_helper(spec, **stft_kwargs):
     return n_fft, args_dict
 
 
-def _ola(x, window, hop_length, synth_coeff, weight):
+def _ola(x: torch.Tensor, window: torch.Tensor, hop_length: int, synth_coeff: float,
+         weight: torch.Tensor) -> torch.Tensor:
+    """A helper function to do overlap-and-add.
+
+    Args:
+        x: input tensor of size :math: '(window_size, time)'.
+        window: The window function. If ''None'' will treated as window of all :math:`1` s.
+        hop_length: The distance between neighboring sliding window frames.
+        synth_coeff: The normalized coefficient apply on synthesis window.
+        weight: An identity matrix of size (win_length x win_length) .
+
+    Returns:
+        A 1D-tensor containing the overlap-and-add result.
+
+    """
     if window is not None:
         x = x * window.unsqueeze(-1)
     return F.conv_transpose1d((x * synth_coeff).unsqueeze(0), weight, stride=hop_length).view(-1)
 
 
 def _istft(x, n_fft, win_length, window, hop_length, center, normalized, onesided, synth_coeff, offset, ola_weight):
+    """
+    A helper function to do istft.
+    """
     x = torch.irfft(x.transpose(0, 1), 1, normalized=normalized, onesided=onesided,
                     signal_sizes=[n_fft] if onesided else None)[:, offset:offset + win_length]
 
@@ -69,15 +98,34 @@ def _istft(x, n_fft, win_length, window, hop_length, center, normalized, oneside
     return x
 
 
-def griffin_lim(spec, maxiter=1000, tol=1e-6, alpha=0.99, verbose=1, evaiter=10, **stft_kwargs):
+def griffin_lim(spec: torch.Tensor, maxiter: int = 1000, tol: float = 1e-6, alpha: float = 0.99, verbose: bool = True,
+                evaiter: int = 10, **stft_kwargs) -> torch.Tensor:
+    """Reconstruct spectrogram phase using 'Griffin-Lim' [1]_ and 'Fast Griffin-Lim' [2]_.
+
+    .. [1] Daniel W. Griffin, Jae S. Lim "Signal Estimation from Modified Short-Time Fourier Transform",
+           IEEE 1984, 10.1109/TASSP.1984.1164317
+    .. [2] N. Perraudin, P. Balazs and P. L. Søndergaard, "A fast Griffin-Lim algorithm",
+           IEEE 2013, 10.1109/WASPAA.2013.6701851
+
+    Args:
+        spec:
+        maxiter:
+        tol:
+        alpha:
+        verbose:
+        evaiter:
+        **stft_kwargs:
+
+    Returns:
+
+    """
     n_fft, proccessed_args = _args_helper(spec, **stft_kwargs)
 
     istft = partial(_istft, n_fft=n_fft, **proccessed_args)
 
-    new_spec = torch.stack((spec, torch.zeros_like(spec)), -1)
+    new_spec = SPSI_phase_init(spec, **stft_kwargs)
     pre_spec = new_spec.clone()
-    # x = istft(new_spec)
-    x = SPSI(spec, **stft_kwargs)
+    x = istft(new_spec)
 
     criterion = nn.MSELoss()
     init_loss = None
@@ -206,10 +254,8 @@ def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, decay=False, gamma=1.3, verbose=
 
     istft = partial(_istft, n_fft=n_fft, **proccessed_args)
 
-    x = SPSI(spec, **stft_kwargs)
-    X = torch.stft(x, n_fft, **stft_kwargs)
-    # X = torch.stack((spec, torch.zeros_like(spec)), -1)
-    # x = istft(X)
+    X = SPSI_phase_init(spec, **stft_kwargs)
+    x = istft(X)
     Z = X.clone()
     Y = X.clone()
     U = torch.zeros_like(X)
@@ -376,36 +422,9 @@ def PGHI(spec, window='hann', **kwargs):
 
 
 @torch.no_grad()
-def SPSI(spec, **kwargs):
-    device = spec.device
-    dtype = spec.dtype
-    internal_dict = {'win_length': None, 'window': None, 'hop_length': None, 'center': True, 'normalized': False,
-                     'onesided': True}
-    for key, item in internal_dict.items():
-        try:
-            internal_dict[key] = kwargs[key]
-        except:
-            pass
-    win_length, window, hop_length, center, normalized, onesided = tuple(internal_dict.values())
-
-    if onesided:
-        n_fft = (spec.shape[0] - 1) * 2
-    else:
-        n_fft = spec.shape[0]
-
-    if not win_length:
-        win_length = n_fft
-
-    if not hop_length:
-        hop_length = n_fft // 4
-
-    if window is None:
-        coeff = hop_length / win_length
-    else:
-        coeff = hop_length / window.pow(2).sum()
-
-    offset = (n_fft - win_length) // 2
-    conv_weight = torch.eye(win_length, dtype=dtype, device=device).unsqueeze(1)
+def SPSI_phase_init(spec, **stft_kwargs):
+    n_fft, proccessed_args = _args_helper(spec, **stft_kwargs)
+    hop_length = proccessed_args['hop_length']
 
     phase = torch.zeros_like(spec)
 
@@ -420,11 +439,6 @@ def SPSI(spec, **kwargs):
     b_peaks = torch.nonzero(mask).t()
     p = 0.5 * (a - r) / (a - 2 * b + r)
     omega = pi2 * (b_peaks[0].float() + p) / n_fft * hop_length
-    pi_shift = p > 0
-
-    def unwarp(x):
-        x %= pi2
-        return torch.where(x > np.pi, x - pi2, x)
 
     idx1, idx2 = b_peaks.unbind()
     phase[idx1, idx2] = omega
@@ -432,18 +446,7 @@ def SPSI(spec, **kwargs):
     phase[idx1 + 1, idx2] = omega
 
     phase = torch.cumsum(phase, 1, out=phase)
-    # phase = unwarp(phase)
-
     x = torch.stack((torch.cos(phase), torch.sin(phase)), 2) * spec.unsqueeze(2)
-    x = torch.irfft(x.transpose(0, 1), 1, normalized=normalized, onesided=onesided,
-                    signal_sizes=[n_fft] if onesided else None)[:, offset:offset + win_length] * coeff
-    if window is not None:
-        x *= window
-    x = x.t().unsqueeze(0)
-    x = F.conv_transpose1d(x, conv_weight, stride=hop_length).view(-1)
-    if center:
-        x = x[win_length // 2:-win_length // 2]
-
     return x
 
 
