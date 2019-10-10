@@ -5,12 +5,11 @@ from torch.optim.lbfgs import LBFGS
 from tqdm import tqdm
 from functools import partial
 import numpy as np
-from collections import OrderedDict
 import heapq
 
 pi2 = 2 * np.pi
 
-from metrics import spectral_convergence, SNR, SER
+from .metrics import spectral_convergence, SNR, SER
 
 
 def _args_helper(spec: torch.Tensor, **stft_kwargs) -> (int, dict):
