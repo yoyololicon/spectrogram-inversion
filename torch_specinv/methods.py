@@ -97,25 +97,25 @@ def _istft(x, n_fft, win_length, window, hop_length, center, normalized, oneside
     return x
 
 
-def griffin_lim(spec: torch.Tensor, maxiter: int = 1000, tol: float = 1e-6, alpha: float = 0.99, verbose: bool = True,
-                evaiter: int = 10, **stft_kwargs) -> torch.Tensor:
-    """Reconstruct spectrogram phase using 'Griffin-Lim' [1]_ and 'Fast Griffin-Lim' [2]_.
+def griffin_lim(spec: torch.Tensor, maxiter: int = 200, tol: float = 1e-6, alpha: float = 0.99, verbose: bool = True,
+                evaiter: int = 10, metric='sc', **stft_kwargs) -> torch.Tensor:
+    r"""Reconstruct spectrogram phase using the well known `Griffin-Lim`_ algorithm and its variation, `Fast Griffin-Lim`_.
 
-    .. [1] Daniel W. Griffin, Jae S. Lim "Signal Estimation from Modified Short-Time Fourier Transform",
-           IEEE 1984, 10.1109/TASSP.1984.1164317
-    .. [2] N. Perraudin, P. Balazs and P. L. Søndergaard, "A fast Griffin-Lim algorithm",
-           IEEE 2013, 10.1109/WASPAA.2013.6701851
+    .. _`Griffin-Lim`: https://pdfs.semanticscholar.org/14bc/876fae55faf5669beb01667a4f3bd324a4f1.pdf
+    .. _`Fast Griffin-Lim`: https://perraudin.info/publications/perraudin-note-002.pdf
 
     Args:
-        spec:
-        maxiter:
-        tol:
-        alpha:
-        verbose:
-        evaiter:
-        **stft_kwargs:
+        spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude) or :math:`(N \times T \times 2)` (complex input)
+        maxiter (int): maximum number of iterations before timing out
+        tol (float): tolerance of the stopping condition base on L2 loss. Default: ``1e-6``.
+        alpha (float): speedup parameter used in `Fast Griffin-Lim`_, set it to zero will disable it. Default: ``0``
+        verbose (bool): whether to be verbose. Default: ``True``
+        evaiter (int): steps size for evaluation. After each step, the function defined in ``metric`` will evaluate. Default: ``10``
+        metric (str): evaluation function. Currently available functions: ``'sc'`` (spectral convergence), ``'snr'`` or ``'ser'``. Default: ``'sc'``
+        **stft_kwargs: other argments that pass to ``torch.stft``
 
     Returns:
+        A 1d tensor converted from the given spectrogram
 
     """
     n_fft, proccessed_args = _args_helper(spec, **stft_kwargs)
@@ -128,6 +128,20 @@ def griffin_lim(spec: torch.Tensor, maxiter: int = 1000, tol: float = 1e-6, alph
 
     criterion = nn.MSELoss()
     init_loss = None
+    bar_dict = {}
+    if metric == 'snr':
+        metric_func = SNR
+        bar_dict['SNR'] = 0
+        metric = metric.upper()
+    elif metric == 'ser':
+        metric_func = SER
+        bar_dict['SER'] = 0
+        metric = metric.upper()
+    else:
+        metric_func = spectral_convergence
+        bar_dict['spectral_convergence'] = 0
+        metric = 'spectral_convergence'
+
     with tqdm(total=maxiter, disable=not verbose) as pbar:
         for i in range(maxiter):
             new_spec[:] = torch.stft(x, n_fft, **stft_kwargs)
@@ -139,11 +153,9 @@ def griffin_lim(spec: torch.Tensor, maxiter: int = 1000, tol: float = 1e-6, alph
             x[:] = istft(new_spec)
 
             if i % evaiter == evaiter - 1:
-                c = spectral_convergence(mag, spec).item()
+                bar_dict[metric] = metric_func(mag, spec).item()
                 l2_loss = criterion(mag, spec).item()
-                snr = SNR(mag, spec).item()
-                ser = SER(mag, spec).item()
-                pbar.set_postfix(snr=snr, ser=ser, spectral_convergence=c, loss=l2_loss)
+                pbar.set_postfix(**bar_dict, loss=l2_loss)
                 pbar.update(evaiter)
 
                 if not init_loss:
@@ -167,6 +179,9 @@ def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, maxiter=25, alpha=0.9
     onesided = proccessed_args['onesided']
     normalized = proccessed_args['normalized']
     ola_weight = proccessed_args['ola_weight']
+    window = proccessed_args['window']
+    if window is None:
+        window = torch.hann_window(win_length).to(spec.device)
 
     num_keep = (win_length - 1) // hop_length
     if look_ahead < 0:
@@ -447,57 +462,3 @@ def SPSI_phase_init(spec, **stft_kwargs):
     phase = torch.cumsum(phase, 1, out=phase)
     x = torch.stack((torch.cos(phase), torch.sin(phase)), 2) * spec.unsqueeze(2)
     return x
-
-
-if __name__ == '__main__':
-    import librosa
-    from librosa import display
-    import matplotlib.pyplot as plt
-    import numpy as np
-
-    nfft = 1024
-    winsize = 1024
-    hopsize = 128
-
-    y, sr = librosa.load(librosa.util.example_audio_file(), duration=30)
-    # librosa.output.write_wav('origin.wav', y, sr)
-    y = torch.Tensor(y).cuda()
-    window = torch.hann_window(winsize).cuda()
-
-
-    def spectrogram(x, *args, p=1, **kwargs):
-        return torch.stft(x, *args, **kwargs).pow(2).sum(2).add_(1e-7).pow(p / 2)
-
-
-    arg_dict = {
-        'win_length': winsize,
-        'window': window,
-        'hop_length': hopsize,
-        'pad_mode': 'reflect',
-        'onesided': True,
-        'normalized': False,
-        'center': True
-    }
-
-    spec = spectrogram(y, nfft, **arg_dict)
-    # func = partial(spectrogram, p=2 / 3, n_fft=1024, window=window)
-    # mag = spec.pow(0.5).cpu().numpy()
-    # phase = np.random.uniform(-np.pi, np.pi, mag.shape)
-    # _, init_x = istft(mag * np.exp(1j * phase), noverlap=1024 - 256)
-
-    # estimated = L_BFGS(spec, func, len(y), maxiter=50, lr=1, history_size=10, evaiter=5)
-    # estimated = griffin_lim(spec, maxiter=100, alpha=0.3, **arg_dict)
-    estimated = ADMM(spec, maxiter=500, rho=0., tol=0, decay=True, gamma=2, **arg_dict)
-    # arg_dict['hop_length'] = 333
-    # estimated = RTISI_LA(spec, maxiter=4, look_ahead=3, asymmetric_window=True, **arg_dict)
-    # estimated = SPSI(spec, **arg_dict)
-    # arg_dict.pop('window')
-    # estimated = PGHI(spec, **arg_dict)
-    estimated_spec = spectrogram(estimated, nfft, **arg_dict)
-    display.specshow(librosa.amplitude_to_db(estimated_spec.cpu().numpy(), ref=np.max), y_axis='log')
-    plt.show()
-
-    print(SNR(estimated_spec, spec).item(), SER(estimated_spec, spec).item(),
-          spectral_convergence(estimated_spec, spec).item())
-
-    librosa.output.write_wav('test.wav', estimated.cpu().numpy(), sr)
