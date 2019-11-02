@@ -4,10 +4,10 @@ import torch.nn.functional as F
 from torch.optim.lbfgs import LBFGS
 from tqdm import tqdm
 from functools import partial
-import numpy as np
+import math
 import heapq
 
-pi2 = 2 * np.pi
+pi2 = 2 * math.pi
 
 from .metrics import spectral_convergence, SNR, SER
 
@@ -75,7 +75,7 @@ def _ola(x: torch.Tensor, window: torch.Tensor, hop_length: int, synth_coeff: fl
         weight: An identity matrix of size (win_length x win_length) .
 
     Returns:
-        A 1D-tensor containing the overlap-and-add result.
+        A 1d tensor containing the overlap-and-add result.
 
     """
     if window is not None:
@@ -101,18 +101,20 @@ def griffin_lim(spec: torch.Tensor, maxiter: int = 200, tol: float = 1e-6, alpha
                 evaiter: int = 10, metric='sc', **stft_kwargs) -> torch.Tensor:
     r"""Reconstruct spectrogram phase using the well known `Griffin-Lim`_ algorithm and its variation, `Fast Griffin-Lim`_.
 
+
     .. _`Griffin-Lim`: https://pdfs.semanticscholar.org/14bc/876fae55faf5669beb01667a4f3bd324a4f1.pdf
     .. _`Fast Griffin-Lim`: https://perraudin.info/publications/perraudin-note-002.pdf
 
     Args:
-        spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude) or :math:`(N \times T \times 2)` (complex input)
+        spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude) or :math:`(N \times T \times 2)` (complex input).
+        If a magnitude spectrogram is given, the phase will first be intialized using  ``phase_init``; otherwise start from the complex input.
         maxiter (int): maximum number of iterations before timing out
         tol (float): tolerance of the stopping condition base on L2 loss. Default: ``1e-6``.
         alpha (float): speedup parameter used in `Fast Griffin-Lim`_, set it to zero will disable it. Default: ``0``
         verbose (bool): whether to be verbose. Default: ``True``
         evaiter (int): steps size for evaluation. After each step, the function defined in ``metric`` will evaluate. Default: ``10``
         metric (str): evaluation function. Currently available functions: ``'sc'`` (spectral convergence), ``'snr'`` or ``'ser'``. Default: ``'sc'``
-        **stft_kwargs: other argments that pass to ``torch.stft``
+        **stft_kwargs: other arguments that pass to ``torch.stft``
 
     Returns:
         A 1d tensor converted from the given spectrogram
@@ -122,7 +124,10 @@ def griffin_lim(spec: torch.Tensor, maxiter: int = 200, tol: float = 1e-6, alpha
 
     istft = partial(_istft, n_fft=n_fft, **proccessed_args)
 
-    new_spec = SPSI_phase_init(spec, **stft_kwargs)
+    if len(spec.shape) == 2:
+        new_spec = phase_init(spec, **stft_kwargs)
+    else:
+        new_spec = torch.stack((spec, torch.zeros_like(spec)), 2)
     pre_spec = new_spec.clone()
     x = istft(new_spec)
 
@@ -168,6 +173,27 @@ def griffin_lim(spec: torch.Tensor, maxiter: int = 200, tol: float = 1e-6, alpha
 
 
 def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, maxiter=25, alpha=0.99, verbose=1, **stft_kwargs):
+    r"""
+    Reconstruct spectrogram phase using `Real-Time Iterative Spectrogram Inversion with Look Ahead`_ (RTISI-LA).
+
+    .. _`Real-Time Iterative Spectrogram Inversion with Look Ahead`:
+        https://lonce.org/home/Publications/publications/2007_RealtimeSignalReconstruction.pdf
+
+
+    Args:
+        spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude)
+        look_ahead (int): how many future frames well be consider. ``-1`` will set it to ``(win_length - 1) / hop_length``,
+            ``0`` well disable look-ahead strategy and fall back to original RTISI algorithm. Default: ``-1``.
+        asymmetric_window (bool): whether to apply asymmetric window on the first iteration for new coming frame
+        maxiter (int): number of iterations for each step
+        alpha (float): speedup parameter used in `Fast Griffin-Lim`_, set it to zero will disable it. Default: ``0``
+        verbose (bool): whether to be verbose. Default: ``True``
+        **stft_kwargs: other arguments that pass to ``torch.stft``
+
+    Returns:
+        A 1d tensor converted from the given spectrogram
+
+    """
     n_fft, proccessed_args = _args_helper(spec, **stft_kwargs)
     copyed_kwargs = stft_kwargs.copy()
     copyed_kwargs['center'] = False
@@ -259,27 +285,60 @@ def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, maxiter=25, alpha=0.9
     return x
 
 
-def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, decay=False, gamma=1.3, verbose=1, evaiter=10, **stft_kwargs):
-    """
-    Paper: https://pdfs.semanticscholar.org/14bc/876fae55faf5669beb01667a4f3bd324a4f1.pdf
+def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, verbose=1, evaiter=10, metric='sc', **stft_kwargs):
+    r"""
+    Reconstruct spectrogram phase using `Griffin–Lim Like Phase Recovery via Alternating Direction Method of Multipliers`_ .
+
+    .. _`Griffin–Lim Like Phase Recovery via Alternating Direction Method of Multipliers`:
+        https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=8552369
+
+    Args:
+        spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude) or :math:`(N \times T \times 2)` (complex input).
+        If a magnitude spectrogram is given, the phase will first be intialized using  ``phase_init``; otherwise start from the complex input.
+        maxiter (int): maximum number of iterations before timing out
+        tol (float): tolerance of the stopping condition base on L2 loss. Default: ``1e-6``.
+        rho (float): non-negative speedup parameter. Small value is preferable when the input spectrogram is noisy (inperfect);
+            set it to 1 will behave similar to ``griffin_lim``.  Default: ``0.1``
+        verbose (bool): whether to be verbose. Default: ``True``
+        evaiter (int): steps size for evaluation. After each step, the function defined in ``metric`` will evaluate. Default: ``10``
+        metric (str): evaluation function. Currently available functions: ``'sc'`` (spectral convergence), ``'snr'`` or ``'ser'``. Default: ``'sc'``
+        **stft_kwargs: other arguments that pass to ``torch.stft``
+
+
+    Returns:
+        A 1d tensor converted from the given spectrogram
 
     """
     n_fft, proccessed_args = _args_helper(spec, **stft_kwargs)
 
     istft = partial(_istft, n_fft=n_fft, **proccessed_args)
 
-    X = SPSI_phase_init(spec, **stft_kwargs)
+    if len(spec.shape) == 2:
+        X = phase_init(spec, **stft_kwargs)
+    else:
+        X = torch.stack((spec, torch.zeros_like(spec)), 2)
+
     x = istft(X)
     Z = X.clone()
     Y = X.clone()
     U = torch.zeros_like(X)
-    if decay:
-        rho = torch.linspace(rho ** (1 / gamma), 1, maxiter) ** gamma
-    else:
-        rho = torch.ones(maxiter) * rho
 
     criterion = nn.MSELoss()
     init_loss = None
+    bar_dict = {}
+    if metric == 'snr':
+        metric_func = SNR
+        bar_dict['SNR'] = 0
+        metric = metric.upper()
+    elif metric == 'ser':
+        metric_func = SER
+        bar_dict['SER'] = 0
+        metric = metric.upper()
+    else:
+        metric_func = spectral_convergence
+        bar_dict['spectral_convergence'] = 0
+        metric = 'spectral_convergence'
+
     with tqdm(total=maxiter, disable=not verbose) as pbar:
         for i in range(maxiter):
             # Pc2
@@ -292,16 +351,14 @@ def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, decay=False, gamma=1.3, verbose=
             x[:] = istft(Y)
             reconstruted = torch.stft(x, n_fft, **stft_kwargs)
 
-            Z[:] = (rho[i] * Y + reconstruted) / (1 + rho[i])
+            Z[:] = (rho * Y + reconstruted) / (1 + rho)
             U += X - Z
 
             if i % evaiter == evaiter - 1:
                 mag = reconstruted.pow(2).sum(2).sqrt()
-                c = spectral_convergence(mag, spec).item()
+                bar_dict[metric] = metric_func(mag, spec).item()
                 l2_loss = criterion(mag, spec).item()
-                snr = SNR(mag, spec).item()
-                ser = SER(mag, spec).item()
-                pbar.set_postfix(snr=snr, ser=ser, spectral_convergence=c, loss=l2_loss)
+                pbar.set_postfix(**bar_dict, loss=l2_loss)
                 pbar.update(evaiter)
 
                 if not init_loss:
@@ -313,10 +370,33 @@ def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, decay=False, gamma=1.3, verbose=
     return istft(X)
 
 
-def L_BFGS(spec, transform_fn, samples=None, init_x0=None, maxiter=1000, tol=1e-6, verbose=1, evaiter=10, **kwargs):
-    """
-    Paper: https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=6949659
+def L_BFGS(spec, transform_fn, samples=None, init_x0=None, maxiter=1000, tol=1e-6, verbose=1, evaiter=10, metric='sc',
+           **kwargs):
+    r"""
 
+    Reconstruct spectrogram phase using `Inversion of Auditory Spectrograms, Traditional Spectrograms, and Other
+    Envelope Representations`_, where I directly use the L_BFGS optimizer provided in pytorch. This method doesn't
+    restrict to traditional short-time Fourier Transform, but any kinds of presentation (ex: Mel-scaled Spectrogram) as
+    long as the transform function is differentiable.
+
+    .. _`Inversion of Auditory Spectrograms, Traditional Spectrograms, and Other Envelope Representations`:
+        https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=6949659
+
+    Args:
+        spec (Tensor): the input presentation
+        transform_fn: a function that has the form  c where x is an 1d tensor
+        samples (int): number of samples in time domain
+        init_x0 (Tensor): an 1d tensor that make use as initial time domain samples. If not provided, will use random
+            value tensor with length equal to ``samples``.
+        maxiter (int): maximum number of iterations before timing out
+        tol (float): tolerance of the stopping condition base on L2 loss. Default: ``1e-6``.
+        verbose (bool): whether to be verbose. Default: ``True``
+        evaiter (int): steps size for evaluation. After each step, the function defined in ``metric`` will evaluate. Default: ``10``
+        metric (str): evaluation function. Currently available functions: ``'sc'`` (spectral convergence), ``'snr'`` or ``'ser'``. Default: ``'sc'``
+        **kwargs: other arguments that pass to ``torch.optim.LBFGS``
+
+    Returns:
+        A 1d tensor converted from the given presentation
     """
     if init_x0 is None:
         init_x0 = spec.new_empty(samples).normal_(std=1e-6)
@@ -333,6 +413,20 @@ def L_BFGS(spec, transform_fn, samples=None, init_x0=None, maxiter=1000, tol=1e-
         loss.backward()
         return loss
 
+    bar_dict = {}
+    if metric == 'snr':
+        metric_func = SNR
+        bar_dict['SNR'] = 0
+        metric = metric.upper()
+    elif metric == 'ser':
+        metric_func = SER
+        bar_dict['SER'] = 0
+        metric = metric.upper()
+    else:
+        metric_func = spectral_convergence
+        bar_dict['spectral_convergence'] = 0
+        metric = 'spectral_convergence'
+
     init_loss = None
     with tqdm(total=maxiter, disable=not verbose) as pbar:
         for i in range(maxiter):
@@ -341,10 +435,9 @@ def L_BFGS(spec, transform_fn, samples=None, init_x0=None, maxiter=1000, tol=1e-
             if i % evaiter == evaiter - 1:
                 with torch.no_grad():
                     V = transform_fn(x)
-                    c = spectral_convergence(V, T).item()
-                    l2_loss = criterion(V, T).item()
-                    snr = SNR(V, T).item()
-                    pbar.set_postfix(snr=snr, spectral_convergence=c, loss=l2_loss)
+                    bar_dict[metric] = metric_func(V, spec).item()
+                    l2_loss = criterion(V, spec).item()
+                    pbar.set_postfix(**bar_dict, loss=l2_loss)
                     pbar.update(evaiter)
 
                     if not init_loss:
@@ -356,87 +449,20 @@ def L_BFGS(spec, transform_fn, samples=None, init_x0=None, maxiter=1000, tol=1e-
     return x.detach()
 
 
-@torch.no_grad()
-def PGHI(spec, window='hann', **kwargs):
-    device = spec.device
-    dtype = spec.dtype
-    internal_dict = {'win_length': None, 'hop_length': None, 'center': True, 'normalized': False, 'onesided': True}
-    for key, item in internal_dict.items():
-        try:
-            internal_dict[key] = kwargs[key]
-        except:
-            pass
-    win_length, hop_length, center, normalized, onesided = tuple(internal_dict.values())
+def phase_init(spec, **stft_kwargs):
+    r"""
+    A phase initialize function that can be seen as a simplified version of `Single Pass Spectrogram Inversion`_.
 
-    if onesided:
-        n_fft = (spec.shape[0] - 1) * 2
-    else:
-        n_fft = spec.shape[0]
+    .. _`Single Pass Spectrogram Inversion`:
+        https://ieeexplore.ieee.org/document/7251907
 
-    if not win_length:
-        win_length = n_fft
+    Args:
+        spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude)
+        **stft_kwargs: other arguments that pass to ``torch.stft``
 
-    if not hop_length:
-        hop_length = n_fft // 4
-
-    if window == 'hamming':
-        window = torch.hamming_window(win_length, dtype=dtype, device=device)
-        r = 0.29794 * win_length ** 2
-    elif window == 'blackman':
-        window = torch.blackman_window(win_length, dtype=dtype, device=device)
-        r = 0.17954 * win_length ** 2
-    else:
-        window = torch.hann_window(win_length, dtype=dtype, device=device)
-        r = 0.25645 * win_length ** 2
-
-    coeff = hop_length / window.pow(2).sum()
-
-    offset = (n_fft - win_length) // 2
-    conv_weight = torch.eye(win_length, dtype=dtype, device=device).unsqueeze(1)
-
-    logspec = spec.log()
-    phase = torch.zeros_like(spec)
-
-    def unwarp(x):
-        x %= pi2
-        return torch.where(x > np.pi, x - pi2, x)
-
-    dw = - r / (hop_length * n_fft) * (logspec[:, 2:] - logspec[:, :-2])
-    dw = F.pad(dw, [1, 1])
-    dt = hop_length * n_fft / r * (logspec[2:] - logspec[:-2]) + pi2 * hop_length / n_fft * torch.arange(
-        spec.shape[0], dtype=dtype, device=device)[:, None]
-    dt = F.pad(dt, [0, 0, 1, 1])
-
-    mask = spec > 1e-6 * spec.max()
-    values = torch.masked_select(spec, mask)
-    indices = torch.nonzero(mask).tolist()
-    sorted_idx = torch.argsort(values, descending=True)
-    indices = indices[sorted_idx]
-    values = values[sorted_idx]
-
-    setI = heapq.heapify(list(zip(-values, indices)))
-    pq = []
-    while len(setI):
-        heapq.heappush(pq, setI.heappop())
-
-        while len(pq):
-            _, idx = heapq.heappop(pq)
-
-    x = torch.stack((torch.cos(phase), torch.sin(phase)), 2) * spec.unsqueeze(2)
-    x = torch.irfft(x.transpose(0, 1), 1, normalized=normalized, onesided=onesided,
-                    signal_sizes=[n_fft] if onesided else None)[:, offset:offset + win_length] * coeff
-    if window is not None:
-        x *= window
-    x = x.t().unsqueeze(0)
-    x = F.conv_transpose1d(x, conv_weight, stride=hop_length).view(-1)
-    if center:
-        x = x[win_length // 2:-win_length // 2]
-
-    return x
-
-
-@torch.no_grad()
-def SPSI_phase_init(spec, **stft_kwargs):
+    Returns:
+        The estimated complex value spectrogram of size :math:`(N \times T \times 2)`.
+    """
     n_fft, proccessed_args = _args_helper(spec, **stft_kwargs)
     hop_length = proccessed_args['hop_length']
 
