@@ -106,8 +106,9 @@ def griffin_lim(spec: torch.Tensor, maxiter: int = 200, tol: float = 1e-6, alpha
     .. _`Fast Griffin-Lim`: https://perraudin.info/publications/perraudin-note-002.pdf
 
     Args:
-        spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude) or :math:`(N \times T \times 2)` (complex input).
-        If a magnitude spectrogram is given, the phase will first be intialized using  ``phase_init``; otherwise start from the complex input.
+        spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude) or :math:`(N \times T \times 2)`
+            (complex input). If a magnitude spectrogram is given, the phase will first be intialized using  ``phase_init``; otherwise
+            start from the complex input.
         maxiter (int): maximum number of iterations before timing out
         tol (float): tolerance of the stopping condition base on L2 loss. Default: ``1e-6``.
         alpha (float): speedup parameter used in `Fast Griffin-Lim`_, set it to zero will disable it. Default: ``0``
@@ -294,7 +295,8 @@ def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, verbose=1, evaiter=10, metric='s
 
     Args:
         spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude) or :math:`(N \times T \times 2)` (complex input).
-        If a magnitude spectrogram is given, the phase will first be intialized using  ``phase_init``; otherwise start from the complex input.
+            If a magnitude spectrogram is given, the phase will first be intialized using  ``phase_init``; otherwise
+            start from the complex input.
         maxiter (int): maximum number of iterations before timing out
         tol (float): tolerance of the stopping condition base on L2 loss. Default: ``1e-6``.
         rho (float): non-negative speedup parameter. Small value is preferable when the input spectrogram is noisy (inperfect);
@@ -384,7 +386,7 @@ def L_BFGS(spec, transform_fn, samples=None, init_x0=None, maxiter=1000, tol=1e-
 
     Args:
         spec (Tensor): the input presentation
-        transform_fn: a function that has the form  c where x is an 1d tensor
+        transform_fn: a function that has the form ``spec = transform_fn(x)`` where x is an 1d tensor
         samples (int): number of samples in time domain
         init_x0 (Tensor): an 1d tensor that make use as initial time domain samples. If not provided, will use random
             value tensor with length equal to ``samples``.
