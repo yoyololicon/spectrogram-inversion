@@ -83,3 +83,5 @@ intersphinx_mapping = {
     'python': ('https://docs.python.org/', None),
     'torch': ('https://pytorch.org/docs/master/', None)
 }
+
+autodoc_mock_imports = ['torch', 'tqdm']
