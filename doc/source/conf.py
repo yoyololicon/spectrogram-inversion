@@ -85,3 +85,6 @@ intersphinx_mapping = {
 }
 
 autodoc_mock_imports = ['torch', 'tqdm']
+
+# prevent contents.rst error on readthedocs
+master_doc = 'index'
