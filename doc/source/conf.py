@@ -37,6 +37,8 @@ extensions = ['sphinx.ext.autodoc',
               'sphinx.ext.intersphinx',
               'sphinx.ext.todo',
               'sphinx.ext.coverage',
+              'sphinx.ext.viewcode',
+              'sphinx.ext.githubpages',
               'sphinx.ext.mathjax',
               'sphinx.ext.napoleon']
 
@@ -64,14 +66,13 @@ html_theme = 'sphinx_rtd_theme'
 # documentation.
 #
 
-"""
+
 html_theme_options = {
-    'pytorch_project': 'specinv',
     'collapse_navigation': False,
     'display_version': True,
     'logo_only': True,
 }
-"""
+
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,

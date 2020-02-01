@@ -99,7 +99,7 @@ def _istft(x, n_fft, win_length, window, hop_length, center, normalized, oneside
 
 def griffin_lim(spec: torch.Tensor, maxiter: int = 200, tol: float = 1e-6, alpha: float = 0.99, verbose: bool = True,
                 evaiter: int = 10, metric='sc', **stft_kwargs) -> torch.Tensor:
-    r"""Reconstruct spectrogram phase using the well known `Griffin-Lim`_ algorithm and its variation, `Fast Griffin-Lim`_.
+    r"""Reconstruct spectrogram phase using the will known `Griffin-Lim`_ algorithm and its variation, `Fast Griffin-Lim`_.
 
 
     .. _`Griffin-Lim`: https://pdfs.semanticscholar.org/14bc/876fae55faf5669beb01667a4f3bd324a4f1.pdf
@@ -107,15 +107,15 @@ def griffin_lim(spec: torch.Tensor, maxiter: int = 200, tol: float = 1e-6, alpha
 
     Args:
         spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude) or :math:`(N \times T \times 2)`
-            (complex input). If a magnitude spectrogram is given, the phase will first be intialized using  ``phase_init``; otherwise
-            start from the complex input.
-        maxiter (int): maximum number of iterations before timing out
-        tol (float): tolerance of the stopping condition base on L2 loss. Default: ``1e-6``.
+            (complex input). If a magnitude spectrogram is given, the phase will first be intialized using
+            :func:`torch_specinv.methods.phase_init`; otherwise start from the complex input.
+        maxiter (int): maximum number of iterations before timing out.
+        tol (float): tolerance of the stopping condition base on L2 loss. Default: ``1e-6``
         alpha (float): speedup parameter used in `Fast Griffin-Lim`_, set it to zero will disable it. Default: ``0``
-        verbose (bool): whether to be verbose. Default: ``True``
-        evaiter (int): steps size for evaluation. After each step, the function defined in ``metric`` will evaluate. Default: ``10``
+        verbose (bool): whether to be verbose. Default: :obj:`True`
+        evaiter (int): steps size for evaluation. After each step, the function defined in `metric` will evaluate. Default: ``10``
         metric (str): evaluation function. Currently available functions: ``'sc'`` (spectral convergence), ``'snr'`` or ``'ser'``. Default: ``'sc'``
-        **stft_kwargs: other arguments that pass to ``torch.stft``
+        **stft_kwargs: other arguments that pass to :func:`torch.stft`
 
     Returns:
         A 1d tensor converted from the given spectrogram
@@ -182,14 +182,14 @@ def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, maxiter=25, alpha=0.9
 
 
     Args:
-        spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude)
-        look_ahead (int): how many future frames well be consider. ``-1`` will set it to ``(win_length - 1) / hop_length``,
-            ``0`` well disable look-ahead strategy and fall back to original RTISI algorithm. Default: ``-1``.
-        asymmetric_window (bool): whether to apply asymmetric window on the first iteration for new coming frame
-        maxiter (int): number of iterations for each step
+        spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude).
+        look_ahead (int): how many future frames will be consider. ``-1`` will set it to ``(win_length - 1) / hop_length``,
+            ``0`` will disable look-ahead strategy and fall back to original RTISI algorithm. Default: ``-1``
+        asymmetric_window (bool): whether to apply asymmetric window on the first iteration for new coming frame.
+        maxiter (int): number of iterations for each step.
         alpha (float): speedup parameter used in `Fast Griffin-Lim`_, set it to zero will disable it. Default: ``0``
-        verbose (bool): whether to be verbose. Default: ``True``
-        **stft_kwargs: other arguments that pass to ``torch.stft``
+        verbose (bool): whether to be verbose. Default: :obj:`True`
+        **stft_kwargs: other arguments that pass to :func:`torch.stft`.
 
     Returns:
         A 1d tensor converted from the given spectrogram
@@ -294,17 +294,17 @@ def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, verbose=1, evaiter=10, metric='s
         https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=8552369
 
     Args:
-        spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude) or :math:`(N \times T \times 2)` (complex input).
-            If a magnitude spectrogram is given, the phase will first be intialized using  ``phase_init``; otherwise
-            start from the complex input.
-        maxiter (int): maximum number of iterations before timing out
-        tol (float): tolerance of the stopping condition base on L2 loss. Default: ``1e-6``.
+        spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude) or :math:`(N \times T \times 2)`
+            (complex input). If a magnitude spectrogram is given, the phase will first be intialized using
+            :func:`torch_specinv.methods.phase_init`; otherwise start from the complex input.
+        maxiter (int): maximum number of iterations before timing out.
+        tol (float): tolerance of the stopping condition base on L2 loss. Default: ``1e-6``
         rho (float): non-negative speedup parameter. Small value is preferable when the input spectrogram is noisy (inperfect);
             set it to 1 will behave similar to ``griffin_lim``.  Default: ``0.1``
-        verbose (bool): whether to be verbose. Default: ``True``
+        verbose (bool): whether to be verbose. Default: :obj:`True`
         evaiter (int): steps size for evaluation. After each step, the function defined in ``metric`` will evaluate. Default: ``10``
         metric (str): evaluation function. Currently available functions: ``'sc'`` (spectral convergence), ``'snr'`` or ``'ser'``. Default: ``'sc'``
-        **stft_kwargs: other arguments that pass to ``torch.stft``
+        **stft_kwargs: other arguments that pass to :func:`torch.stft`.
 
 
     Returns:
@@ -377,25 +377,25 @@ def L_BFGS(spec, transform_fn, samples=None, init_x0=None, maxiter=1000, tol=1e-
     r"""
 
     Reconstruct spectrogram phase using `Inversion of Auditory Spectrograms, Traditional Spectrograms, and Other
-    Envelope Representations`_, where I directly use the L_BFGS optimizer provided in pytorch. This method doesn't
-    restrict to traditional short-time Fourier Transform, but any kinds of presentation (ex: Mel-scaled Spectrogram) as
+    Envelope Representations`_, where I directly use the :class:`torch.optim.LBFGS` optimizer provided in PyTorch.
+    This method doesn't restrict to traditional short-time Fourier Transform, but any kinds of presentation (ex: Mel-scaled Spectrogram) as
     long as the transform function is differentiable.
 
     .. _`Inversion of Auditory Spectrograms, Traditional Spectrograms, and Other Envelope Representations`:
         https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=6949659
 
     Args:
-        spec (Tensor): the input presentation
-        transform_fn: a function that has the form ``spec = transform_fn(x)`` where x is an 1d tensor
-        samples (int): number of samples in time domain
-        init_x0 (Tensor): an 1d tensor that make use as initial time domain samples. If not provided, will use random
+        spec (Tensor): the input presentation.
+        transform_fn: a function that has the form ``spec = transform_fn(x)`` where x is an 1d tensor.
+        samples (int, optional): number of samples in time domain. Default: :obj:`None`
+        init_x0 (Tensor, optional): an 1d tensor that make use as initial time domain samples. If not provided, will use random
             value tensor with length equal to ``samples``.
-        maxiter (int): maximum number of iterations before timing out
+        maxiter (int): maximum number of iterations before timing out.
         tol (float): tolerance of the stopping condition base on L2 loss. Default: ``1e-6``.
-        verbose (bool): whether to be verbose. Default: ``True``
+        verbose (bool): whether to be verbose. Default: :obj:`True`
         evaiter (int): steps size for evaluation. After each step, the function defined in ``metric`` will evaluate. Default: ``10``
         metric (str): evaluation function. Currently available functions: ``'sc'`` (spectral convergence), ``'snr'`` or ``'ser'``. Default: ``'sc'``
-        **kwargs: other arguments that pass to ``torch.optim.LBFGS``
+        **kwargs: other arguments that pass to :class:`torch.optim.LBFGS`.
 
     Returns:
         A 1d tensor converted from the given presentation
@@ -459,11 +459,11 @@ def phase_init(spec, **stft_kwargs):
         https://ieeexplore.ieee.org/document/7251907
 
     Args:
-        spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude)
-        **stft_kwargs: other arguments that pass to ``torch.stft``
+        spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude).
+        **stft_kwargs: other arguments that pass to :func:`torch.stft`
 
     Returns:
-        The estimated complex value spectrogram of size :math:`(N \times T \times 2)`.
+        The estimated complex value spectrogram of size :math:`(N \times T \times 2)`
     """
     n_fft, proccessed_args = _args_helper(spec, **stft_kwargs)
     hop_length = proccessed_args['hop_length']

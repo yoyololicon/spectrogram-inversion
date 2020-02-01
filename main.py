@@ -53,6 +53,6 @@ if __name__ == '__main__':
     display.specshow(librosa.amplitude_to_db(estimated_spec.cpu().numpy(), ref=np.max), y_axis='log')
     plt.show()
 
-    print(spectral_convergence(estimated_spec, spec))
+    #print(spectral_convergence(estimated_spec, spec))
 
     #librosa.output.write_wav('test.wav', estimated.cpu().numpy(), sr)
