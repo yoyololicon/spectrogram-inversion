@@ -1,21 +1,78 @@
-# Spectrogram Inversion
+# PyTorch Spectrogram Inversion Documentation
 
-Some useful spectrogram inversion tools written in PyTorch.
+A major direction of Deep Learning in audio, especially generative models, is using features in frequency domain because
+directly model raw time signal is hard.
+But this require an extra process to convert the predicted spectrogram (magnitude-only in most situation) back to time domain.
 
-## Methods
+To help researcher no need to care this post-precessing step, this package provide some useful and classic spectrogram
+inversion algorithms. These algorithms are selected base on their performance and high parallelizability, and can even
+be integrated in your model training process.
 
-### Griffin & Lim
-Griffin, Daniel, and Jae Lim. "Signal estimation from modified short-time Fourier transform." IEEE Transactions on Acoustics, Speech, and Signal Processing 32, no. 2 (1984): 236-243.
+We hope this tool can serve as a standard, making fair comparison of different audio generation models.
 
-### RTISI-LA
-Zhu, Xinglei, Gerald T. Beauregard, and Lonce Wyse. "Real-time iterative spectrum inversion with look-ahead." In 2006 IEEE International Conference on Multimedia and Expo, pp. 229-232. IEEE, 2006.
+## Installation
 
-### L-BFGS
-Decorsière, Rémi, Peter L. Søndergaard, Ewen N. MacDonald, and Torsten Dau. "Inversion of auditory spectrograms, traditional spectrograms, and other envelope representations." IEEE/ACM Transactions on Audio, Speech, and Language Processing 23, no. 1 (2014): 46-56.
+### PyPi
+
+First [Install PyTorch](https://pytorch.org/get-started/locally/) with the desired cpu/gpu support and version >= 0.4.1.
+Then install via pip
+```
+pip install torch_specinv
+```
+or
+```
+pip install git+https://github.com/yoyololicon/spectrogram-inversion
+```
+to get the latest version.
 
 
+## Getting Started
+The following example estimated the time signal given only the magnitude information of an audio file.
+
+```python
+import torch
+import librosa
+from torch_specinv import griffin_lim
+from torch_specinv.metrics import spectral_convergence as SC
+
+y, sr = librosa.load(librosa.util.example_audio_file())
+y = torch.from_numpy(y)
+windowsize = 2048
+window = torch.hann_window(windowsize)
+S = torch.stft(y, windowsize, window=window)
+
+# discard phase information
+mag = S.pow(2).sum(2).sqrt()
+
+# move to gpu memory for faster computation
+mag = mag.cuda()
+
+yhat = griffin_lim(mag, maxiter=100, alpha=0.3, window=window)
+
+# check convergence
+mag_hat = torch.stft(yhat, windowsize, window=window).pow(2).sum(2).sqrt()
+print(SC(mag_hat, mag))
+```
+
+Reconstruct from other spectral representation:
+
+```python
+from librosa.filters import mel
+from torch_specinv import L_BFGS
+
+filter_banks = torch.from_numpy(mel(sr, windowsize)).cuda()
+
+def trsfn(x):
+    S = torch.stft(x, windowsize, window=window).pow(2).sum(2).sqrt()
+    mel_S = filter_banks @ S
+    return torch.log1p(mel_S)
+
+y = y.cuda()
+mag = trsfn(y)
+yhat = L_BFGS(mag, trsfn, len(y))       
+```
 
 ## TODO
 - [ ] Speed comparison on GPU. 
-- [ ] Documentation.
+- [x] Documentation.
 - [ ] Examples.
