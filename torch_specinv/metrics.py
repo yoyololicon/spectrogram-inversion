@@ -6,7 +6,7 @@ def spectral_convergence(input: torch.Tensor, target: torch.Tensor) -> torch.Ten
     The Spectral Convergence score is calculated as follow:
 
     .. math::
-        \mathcal{C}(\mathbf{S}_i, \mathbf{S}_t)=\frac{\|\mathbf{S}_i-\mathbf{S}_t\|_{Fro}}{\|\mathbf{S}_t\|_{Fro}}
+        \mathcal{C}(\mathbf{\hat{S}}, \mathbf{S})=\frac{\|\mathbf{\hat{S}}_i-\mathbf{S}\|_{Fro}}{\|\mathbf{S}\|_{Fro}}
 
     Returns:
         scalar output in db scale.
