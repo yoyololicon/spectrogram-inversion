@@ -98,7 +98,7 @@ def _istft(x, n_fft, win_length, window, hop_length, center, normalized, oneside
 
 
 def griffin_lim(spec: torch.Tensor, maxiter: int = 200, tol: float = 1e-6, alpha: float = 0.99, verbose: bool = True,
-                evaiter: int = 10, metric='sc', **stft_kwargs) -> torch.Tensor:
+                evaiter: int = 10, metric='sc', **stft_kwargs):
     r"""Reconstruct spectrogram phase using the will known `Griffin-Lim`_ algorithm and its variation, `Fast Griffin-Lim`_.
 
 
