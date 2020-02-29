@@ -133,8 +133,8 @@ def griffin_lim(spec, maxiter=200, tol=1e-6, alpha=0.99, verbose=True, evaiter=1
             cmplx_spec = spec
         target_spec = cmplx_spec.pow(2).sum(-1).sqrt()
 
-    n_fft, proccessed_args = _args_helper(target_spec, **stft_kwargs)
-    istft = partial(_istft, n_fft=n_fft, **proccessed_args)
+    n_fft, processed_args = _args_helper(target_spec, **stft_kwargs)
+    istft = partial(_istft, n_fft=n_fft, **processed_args)
     pre_spec = cmplx_spec.clone()
     x, norm_envelope = istft(cmplx_spec)
 
@@ -210,18 +210,18 @@ def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, maxiter=25, alpha=0.9
     else:
         target_spec = spec
 
-    n_fft, proccessed_args = _args_helper(target_spec, **stft_kwargs)
+    n_fft, processed_args = _args_helper(target_spec, **stft_kwargs)
     copyed_kwargs = stft_kwargs.copy()
     copyed_kwargs['center'] = False
 
-    win_length = proccessed_args['win_length']
-    hop_length = proccessed_args['hop_length']
-    offset = proccessed_args['offset']
-    onesided = proccessed_args['onesided']
-    normalized = proccessed_args['normalized']
-    ola_weight = proccessed_args['ola_weight']
-    # ola_weight_straight = torch.eye(win_length, dtype=target_spec.dtype, device=target_spec.device).unsqueeze(1)
-    window = proccessed_args['window']
+    win_length = processed_args['win_length']
+    hop_length = processed_args['hop_length']
+    offset = processed_args['offset']
+    onesided = processed_args['onesided']
+    normalized = processed_args['normalized']
+    ola_weight = processed_args['ola_weight']
+
+    window = processed_args['window']
     if window is None:
         window = torch.diagonal(ola_weight.squeeze())
         synth_coeff = hop_length / win_length
@@ -238,7 +238,6 @@ def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, maxiter=25, alpha=0.9
     for i in range(num_keep):
         asym_window1[(i + 1) * hop_length:] += window.flip(0)[:-(i + 1) * hop_length:]
     asym_window1 *= synth_coeff
-    # asym_window1 *= hop_length / (asym_window1 * window).sum() / synth_coef
 
     asym_window2 = target_spec.new_zeros(win_length)
     for i in range(num_keep + 1):
@@ -261,9 +260,6 @@ def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, maxiter=25, alpha=0.9
     update_chunk = torch.cat((update_chunk,
                               irfft(torch.stack((first_frame, torch.zeros_like(first_frame)), -1))[:, None, :]), 1)
 
-    # xt_winview[:, num_keep + look_ahead] = irfft(torch.stack((first_frame, torch.zeros_like(first_frame)), -1))[:,
-    #                                       offset:offset + win_length]
-
     lr = alpha / (1 + alpha)
     output_xt_list = []
     with tqdm(total=steps + look_ahead, disable=not verbose) as pbar:
@@ -283,7 +279,8 @@ def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, maxiter=25, alpha=0.9
                     else:
                         xt_asym_wind = xt_winview[:, -1:] * asym_window1
 
-                    xt = F.pad(torch.cat((xt_norm_wind, xt_asym_wind), 1), [offset, offset])
+                    xt = F.pad(torch.cat((xt_norm_wind, xt_asym_wind), 1), [offset, offset],
+                               mode=stft_kwargs['pad_mode'] if 'pad_mode' in stft_kwargs.keys() else 'constant')
                     new_spec = rfft(xt).transpose(1, 2)
                 else:
                     new_spec = torch.stft(F.pad(x, [0, offset]),
@@ -307,7 +304,7 @@ def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, maxiter=25, alpha=0.9
 
     all_xt = torch.stack(output_xt_list[look_ahead if look_ahead else 0:], 2)
     x, _ = _ola(all_xt, hop_length, ola_weight)
-    if proccessed_args['center']:
+    if processed_args['center']:
         x = x[:, win_length // 2:-win_length // 2]
 
     return x.squeeze(0)
@@ -338,16 +335,25 @@ def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, verbose=1, evaiter=10, metric='s
         A 1d tensor converted from the given spectrogram
 
     """
-    n_fft, proccessed_args = _args_helper(spec, **stft_kwargs)
-
-    istft = partial(_istft, n_fft=n_fft, **proccessed_args)
-
-    if len(spec.shape) == 2:
-        X = phase_init(spec, **stft_kwargs)
+    if spec.shape[-1] != 2:
+        cmplx_spec = phase_init(spec, **stft_kwargs)
+        if len(cmplx_spec.shape) == 3:
+            target_spec = spec.unsqueeze(0)
+            cmplx_spec = cmplx_spec.unsqueeze(0)
+        else:
+            target_spec = spec
     else:
-        X = torch.stack((spec, torch.zeros_like(spec)), 2)
+        if len(spec.shape) == 3:
+            cmplx_spec = spec.unsqueeze(0)
+        else:
+            cmplx_spec = spec
+        target_spec = cmplx_spec.pow(2).sum(-1).sqrt()
 
-    x = istft(X)
+    n_fft, processed_args = _args_helper(target_spec, **stft_kwargs)
+    istft = partial(_istft, n_fft=n_fft, **processed_args)
+
+    X = cmplx_spec
+    x, norm_envelope = istft(X)
     Z = X.clone()
     Y = X.clone()
     U = torch.zeros_like(X)
@@ -371,21 +377,21 @@ def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, verbose=1, evaiter=10, metric='s
     with tqdm(total=maxiter, disable=not verbose) as pbar:
         for i in range(maxiter):
             # Pc2
-            X[:] = Z - U
-            mag = X.pow(2).sum(2).sqrt()
-            X *= (spec / F.threshold_(mag, 1e-7, 1e-7)).unsqueeze(-1)
+            X = Z - U
+            norm = X.pow(2).sum(-1).sqrt() + 1e-16
+            X = X * (target_spec / norm).unsqueeze(-1)
 
-            Y[:] = X + U
+            Y = X + U
             # Pc1
-            x[:] = istft(Y)
+            x, _ = istft(Y, norm_envelope=norm_envelope)
             reconstruted = torch.stft(x, n_fft, **stft_kwargs)
 
-            Z[:] = (rho * Y + reconstruted) / (1 + rho)
-            U += X - Z
+            Z = (rho * Y + reconstruted) / (1 + rho)
+            U = U + X - Z
 
             if i % evaiter == evaiter - 1:
-                mag = reconstruted.pow(2).sum(2).sqrt()
-                bar_dict[metric] = metric_func(mag, spec).item()
+                mag = reconstruted.pow(2).sum(-1).sqrt()
+                bar_dict[metric] = metric_func(mag, target_spec).item()
                 l2_loss = criterion(mag, spec).item()
                 pbar.set_postfix(**bar_dict, loss=l2_loss)
                 pbar.update(evaiter)
@@ -396,7 +402,8 @@ def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, verbose=1, evaiter=10, metric='s
                     break
                 previous_loss = l2_loss
 
-    return istft(X)
+    x, _ = istft(Y, norm_envelope=norm_envelope)
+    return x.squeeze(0)
 
 
 def L_BFGS(spec, transform_fn, samples=None, init_x0=None, maxiter=1000, tol=1e-6, verbose=1, evaiter=10, metric='sc',
@@ -492,8 +499,8 @@ def phase_init(spec, **stft_kwargs):
     Returns:
         The estimated complex value spectrogram of size :math:`(N \times T \times 2)`
     """
-    n_fft, proccessed_args = _args_helper(spec, **stft_kwargs)
-    hop_length = proccessed_args['hop_length']
+    n_fft, processed_args = _args_helper(spec, **stft_kwargs)
+    hop_length = processed_args['hop_length']
 
     if len(spec.shape) == 2:
         spec = spec.unsqueeze(0)
