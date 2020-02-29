@@ -1,12 +1,12 @@
 import torch
 
 
-def spectral_convergence(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def spectral_convergence(input, target):
     r"""
     The Spectral Convergence score is calculated as follow:
 
     .. math::
-        \mathcal{C}(\mathbf{\hat{S}}, \mathbf{S})=\frac{\|\mathbf{\hat{S}}_i-\mathbf{S}\|_{Fro}}{\|\mathbf{S}\|_{Fro}}
+        \mathcal{C}(\mathbf{\hat{S}}, \mathbf{S})=\frac{\|\mathbf{\hat{S}}-\mathbf{S}\|_{Fro}}{\|\mathbf{S}\|_{Fro}}
 
     Returns:
         scalar output in db scale.
