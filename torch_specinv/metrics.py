@@ -1,7 +1,7 @@
 import torch
 
 
-def spectral_convergence(input, target):
+def sc(input, target):
     r"""
     The Spectral Convergence score is calculated as follow:
 
@@ -14,7 +14,7 @@ def spectral_convergence(input, target):
     return 20 * ((input - target).norm().log10() - target.norm().log10())
 
 
-def SNR(input, target):
+def snr(input, target):
     r"""
     The Signal-to-Noise Ratio (SNR) is calculated as follow:
 
@@ -28,7 +28,7 @@ def SNR(input, target):
     return -10 * (input / input.norm() - target / target.norm()).pow(2).sum().log10()
 
 
-def SER(input, target):
+def ser(input, target):
     r"""
     The Signal-to-Error Ratio (SER) is calculated as follow:
 

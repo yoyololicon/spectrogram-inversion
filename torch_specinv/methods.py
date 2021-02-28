@@ -1,4 +1,4 @@
-from .metrics import spectral_convergence, SNR, SER
+from .metrics import *
 import torch
 import torch.nn as nn
 import torch.fft as fft
@@ -10,6 +10,12 @@ from typing import Tuple
 import math
 
 pi2 = 2 * math.pi
+
+_func_mapper = {
+    'SC': sc,
+    'SNR': snr,
+    'SER': ser
+}
 
 
 def _args_helper(spec, **stft_kwargs) -> Tuple[int, dict]:
@@ -87,7 +93,7 @@ def _istft(x, n_fft, win_length, window, hop_length, center, normalized, oneside
     """
     A helper function to do istft.
     """
-    x = fft.irfft(x, n=n_fft if onesided else None, dim=-2, norm='ortho' if normalized else None)[..., offset:offset + win_length]
+    x = fft.irfft(x, n=n_fft if onesided else None, dim=-2, norm='ortho' if normalized else None)[:, offset:offset + win_length]
 
     x, norm_envelope = _ola(x, hop_length, ola_weight, norm_envelope)
     if center:
@@ -128,6 +134,7 @@ def griffin_lim(spec,
     assert eva_iter > 0
     assert max_iter > 0
     assert alpha >= 0
+    assert metric.upper() in list(_func_mapper.keys())
 
     shape = spec.shape
     assert 4 > len(shape) > 1
@@ -150,19 +157,11 @@ def griffin_lim(spec,
 
     criterion = nn.MSELoss()
     init_loss = None
+
+    metric = metric.upper()
     bar_dict = {}
-    if metric == 'snr':
-        metric_func = SNR
-        bar_dict['SNR'] = 0
-        metric = metric.upper()
-    elif metric == 'ser':
-        metric_func = SER
-        bar_dict['SER'] = 0
-        metric = metric.upper()
-    else:
-        metric_func = spectral_convergence
-        bar_dict['spectral_convergence'] = 0
-        metric = 'spectral_convergence'
+    bar_dict[metric] = 0
+    metric_func = _func_mapper[metric]
 
     lr = alpha / (1 + alpha)
 
@@ -215,10 +214,16 @@ def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, max_iter=25, alpha=0.
         A 1d tensor converted from the given spectrogram
 
     """
-    if len(spec.shape) == 2:
-        target_spec = spec.unsqueeze(0)
-    else:
-        target_spec = spec
+    assert max_iter > 0
+    assert alpha >= 0
+    assert not spec.is_complex()
+
+    shape = spec.shape
+    assert 4 > len(shape) > 1
+    if len(shape) == 2:
+        spec = spec.unsqueeze(0)
+
+    target_spec = spec
 
     n_fft, processed_args = _args_helper(target_spec, **stft_kwargs)
     copyed_kwargs = stft_kwargs.copy()
