@@ -15,7 +15,7 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     url="https://github.com/yoyololicon/spectrogram-inversion",
     packages=setuptools.find_packages(),
-    install_requires=['torch>=0.4.1', 'tqdm'],
+    install_requires=['torch>=1.6.0', 'tqdm'],
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",

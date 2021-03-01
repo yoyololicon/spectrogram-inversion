@@ -106,7 +106,7 @@ def _spec_formatter(spec, **stft_kwargs):
     return cmplx_spec, target_spec
 
 
-def _ola(x, hop_length, weight, norm_envelope=None):
+def _ola(x, hop_length, weight, padding, norm_envelope=None):
     """A helper function to do overlap-and-add.
 
     Args:
@@ -119,10 +119,10 @@ def _ola(x, hop_length, weight, norm_envelope=None):
         A 1d tensor containing the overlap-and-add result.
 
     """
-    ola_x = F.conv_transpose1d(x, weight, stride=hop_length).squeeze(1)
+    ola_x = F.conv_transpose1d(x, weight, stride=hop_length, padding=padding).squeeze(1)
     if norm_envelope is None:
         norm_envelope = F.conv_transpose1d(torch.ones_like(
-            x[:1]), weight * weight, stride=hop_length).squeeze()
+            x[:1]), weight * weight, stride=hop_length, padding=padding).squeeze()
     return ola_x / norm_envelope, norm_envelope
 
 
@@ -138,9 +138,10 @@ def _istft(x, n_fft, offset, ola_weight,
         x = fft.ifft(x, n=n_fft, dim=-2, norm='ortho' if normalized else 'backward').real
     x = x[:, offset:offset + win_length]
 
-    x, norm_envelope = _ola(x, hop_length, ola_weight, norm_envelope)
-    if center:
-        x = x[:, win_length // 2:-win_length // 2]
+    x, norm_envelope = _ola(x, hop_length, ola_weight, padding=win_length // 2 if center else 0,
+                            norm_envelope=norm_envelope)
+    if offset and not center:
+        x = F.pad(x, [offset, offset])
     return x, norm_envelope
 
 
@@ -154,12 +155,18 @@ def _training_loop(
         eva_iter,
         metric,
 ):
+    assert eva_iter > 0
+    assert max_iter > 0
+    assert tol >= 0
+
     metric = metric.upper()
+    assert metric.upper() in _func_mapper.keys()
+
     bar_dict = {}
     bar_dict[metric] = 0
     metric_func = _func_mapper[metric]
 
-    criterion = nn.MSELoss()
+    criterion = F.mse_loss
     init_loss = None
 
     with tqdm(total=max_iter, disable=not verbose) as pbar:
@@ -173,7 +180,7 @@ def _training_loop(
 
                 if not init_loss:
                     init_loss = l2_loss
-                elif (previous_loss - l2_loss) / init_loss < tol * eva_iter and previous_loss > l2_loss:
+                elif (previous_loss - l2_loss) / init_loss < tol and previous_loss > l2_loss:
                     break
                 previous_loss = l2_loss
 
@@ -208,10 +215,7 @@ def griffin_lim(spec,
         A 1d tensor converted from the given spectrogram
 
     """
-    assert eva_iter > 0
-    assert max_iter > 0
     assert alpha >= 0
-    assert metric.upper() in list(_func_mapper.keys())
 
     cmplx_spec, target_spec = _spec_formatter(spec, **stft_kwargs)
     n_fft, processed_args = _args_helper(target_spec, **stft_kwargs)
@@ -234,7 +238,7 @@ def griffin_lim(spec,
         new_spec = new_spec - pre_spec * lr
         status_dict['pre_spec'] = new_spec
 
-        norm = new_spec.abs() + 1e-16
+        norm = new_spec.abs().add_(1e-16)
         new_spec = new_spec * target_spec / norm
         x, _ = istft(new_spec, norm_envelope=norm_envelope)
         status_dict['x'] = x
@@ -256,7 +260,9 @@ def griffin_lim(spec,
         metric
     )
     x = stats['x']
-    return x.squeeze(0)
+    if not (spec.shape[0] == 1 and len(spec.shape) == 3):
+        x = x.squeeze(0)
+    return x
 
 
 def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, max_iter=25, alpha=0.99, verbose=1, **stft_kwargs):
@@ -443,7 +449,6 @@ def ADMM(spec, max_iter=1000, tol=1e-6, rho=0.1, verbose=1, eva_iter=10, metric=
     Y = X.clone()
     U = torch.zeros_like(X)
 
-
     def closure(status_dict):
         X = status_dict['X']
         Y = status_dict['Y']
@@ -522,52 +527,36 @@ def L_BFGS(spec, transform_fn, samples=None, init_x0=None, max_iter=1000, tol=1e
         A 1d tensor converted from the given presentation
     """
     if init_x0 is None:
-        init_x0 = spec.new_empty(samples).normal_(std=1e-6)
+        init_x0 = spec.new_empty(*samples).normal_(std=1e-6)
     x = nn.Parameter(init_x0)
     T = spec
 
     criterion = nn.MSELoss()
     optimizer = LBFGS([x], **kwargs)
 
-    def closure():
+    def inner_closure():
         optimizer.zero_grad()
         V = transform_fn(x)
         loss = criterion(V, T)
         loss.backward()
         return loss
 
-    bar_dict = {}
-    if metric == 'snr':
-        metric_func = SNR
-        bar_dict['SNR'] = 0
-        metric = metric.upper()
-    elif metric == 'ser':
-        metric_func = SER
-        bar_dict['SER'] = 0
-        metric = metric.upper()
-    else:
-        metric_func = spectral_convergence
-        bar_dict['spectral_convergence'] = 0
-        metric = 'spectral_convergence'
+    def outer_closure(status_dict):
+        optimizer.step(inner_closure)
+        with torch.no_grad():
+            V = transform_fn(x)
+        return V
 
-    init_loss = None
-    with tqdm(total=max_iter, disable=not verbose) as pbar:
-        for i in range(max_iter):
-            optimizer.step(closure)
-
-            if i % eva_iter == eva_iter - 1:
-                with torch.no_grad():
-                    V = transform_fn(x)
-                    bar_dict[metric] = metric_func(V, spec).item()
-                    l2_loss = criterion(V, spec).item()
-                    pbar.set_postfix(**bar_dict, loss=l2_loss)
-                    pbar.update(eva_iter)
-
-                    if not init_loss:
-                        init_loss = l2_loss
-                    elif (previous_loss - l2_loss) / init_loss < tol * eva_iter:
-                        break
-                    previous_loss = l2_loss
+    _training_loop(
+        outer_closure,
+        {},
+        T,
+        max_iter,
+        tol,
+        verbose,
+        eva_iter,
+        metric
+    )
 
     return x.detach()
 
@@ -601,18 +590,21 @@ def phase_init(spec, **stft_kwargs):
         mask = (x[:, 1:-1] > x[:, 2:]) & (x[:, 1:-1] > x[:, :-2])
         return F.pad(mask, [0, 0, 1, 1])
 
-    mask = peak_picking(spec)
-    b = torch.masked_select(spec, mask)
-    a = torch.masked_select(spec[:, :-1], mask[:, 1:])
-    r = torch.masked_select(spec[:, 1:], mask[:, :-1])
-    idx1, idx2, idx3 = torch.nonzero(mask).t().unbind()
-    p = 0.5 * (a - r) / (a - 2 * b + r)
-    omega = pi2 * (idx2.float() + p) / n_fft * hop_length
+    with torch.no_grad():
+        mask = peak_picking(spec)
+        b = torch.masked_select(spec, mask)
+        a = torch.masked_select(spec[:, :-1], mask[:, 1:])
+        r = torch.masked_select(spec[:, 1:], mask[:, :-1])
+        idx1, idx2, idx3 = torch.nonzero(mask).t().unbind()
+        p = 0.5 * (a - r) / (a - 2 * b + r)
+        omega = pi2 * (idx2.float() + p) / n_fft * hop_length
 
-    phase[idx1, idx2, idx3] = omega
-    phase[idx1, idx2 - 1, idx3] = omega
-    phase[idx1, idx2 + 1, idx3] = omega
+        phase[idx1, idx2, idx3] = omega
+        phase[idx1, idx2 - 1, idx3] = omega
+        phase[idx1, idx2 + 1, idx3] = omega
 
-    phase = torch.cumsum(phase, 2)
-    x = torch.exp(phase * 1j)
-    return x.view(shape)
+        phase = torch.cumsum(phase, 2)
+        angle = torch.exp(phase * 1j)
+
+    spec = spec * angle
+    return spec.view(shape)
