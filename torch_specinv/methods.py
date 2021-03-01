@@ -18,11 +18,11 @@ _func_mapper = {
 }
 
 
-def _args_helper(spec, **stft_kwargs) -> Tuple[int, dict]:
+def _args_helper(spec, **stft_kwargs):
     """A helper function to get stft arguments from the provided kwargs.
 
     Args:
-        spec: The magnitude spectrum of size (freq x time).
+        spec: The magnitude spectrum of size (*, freq, time).
         **stft_kwargs: Keyword arguments that computed spec from 'torch.stft'.
         See `torch.stft` for details.
 
@@ -31,17 +31,36 @@ def _args_helper(spec, **stft_kwargs) -> Tuple[int, dict]:
         processed_kwargs: Dict object that stored the processed keyword arguments.
 
     """
-    device = spec.device
-    dtype = spec.dtype
-    args_dict = {'win_length': None, 'window': None, 'hop_length': None, 'center': True, 'normalized': False,
-                 'onesided': True}
+    args_dict = {'win_length': None,
+                 'window': None,
+                 'hop_length': None,
+                 'center': True,
+                 'pad_mode': 'reflect',
+                 'normalized': False,
+                 'onesided': None,
+                 'return_complex': None}
     for key, item in args_dict.items():
         try:
             args_dict[key] = stft_kwargs[key]
         except:
             pass
-    win_length, window, hop_length, center, normalized, onesided = tuple(
+    win_length, window, hop_length, center, pad_mode, normalized, onesided, return_complex = tuple(
         args_dict.values())
+
+    device = spec.device
+    dtype = spec.dtype
+    if dtype == torch.complex32:
+        dtype = torch.float16
+    elif dtype == torch.complex64:
+        dtype = torch.float32
+    elif dtype == torch.complex128:
+        dtype = torch.float64
+
+    if onesided is None:
+        if window is not None and window.is_complex():
+            onesided = False
+        else:
+            onesided = True
 
     if onesided:
         n_fft = (spec.shape[-2] - 1) * 2
@@ -55,17 +74,36 @@ def _args_helper(spec, **stft_kwargs) -> Tuple[int, dict]:
         hop_length = n_fft // 4
 
     if window is None:
-        conv_weight = torch.eye(win_length, dtype=dtype,
-                                device=device).unsqueeze(1)
-    else:
-        conv_weight = torch.diag(window).unsqueeze(1)
+        window = torch.ones(win_length, dtype=dtype, device=device)
 
-    offset = (n_fft - win_length) // 2
     args_dict['win_length'] = win_length
     args_dict['hop_length'] = hop_length
-    args_dict['ola_weight'] = conv_weight
-    args_dict['offset'] = offset
+    args_dict['window'] = window
+    args_dict['return_complex'] = True
+    args_dict['onesided'] = onesided
+
     return n_fft, args_dict
+
+
+def _get_offset_and_weight(n_fft, **stft_kwargs):
+    offset = (n_fft - stft_kwargs['win_length']) // 2
+    ola_weight = torch.diag(stft_kwargs['window']).unsqueeze(1)
+    return offset, ola_weight
+
+
+def _spec_formatter(spec, **stft_kwargs):
+    shape = spec.shape
+    assert 4 > len(shape) > 1
+    if len(shape) == 2:
+        spec = spec.unsqueeze(0)
+
+    if not spec.is_complex():
+        cmplx_spec = phase_init(spec, **stft_kwargs)
+        target_spec = spec
+    else:
+        cmplx_spec = spec
+        target_spec = spec.abs()
+    return cmplx_spec, target_spec
 
 
 def _ola(x, hop_length, weight, norm_envelope=None):
@@ -84,21 +122,60 @@ def _ola(x, hop_length, weight, norm_envelope=None):
     ola_x = F.conv_transpose1d(x, weight, stride=hop_length).squeeze(1)
     if norm_envelope is None:
         norm_envelope = F.conv_transpose1d(torch.ones_like(
-            x[:1]), weight.pow(2), stride=hop_length).squeeze()
+            x[:1]), weight * weight, stride=hop_length).squeeze()
     return ola_x / norm_envelope, norm_envelope
 
 
-def _istft(x, n_fft, win_length, window, hop_length, center, normalized, onesided, offset, ola_weight,
+def _istft(x, n_fft, offset, ola_weight,
+           win_length, window, hop_length, center, normalized, onesided, pad_mode, return_complex,
            norm_envelope=None):
     """
     A helper function to do istft.
     """
-    x = fft.irfft(x, n=n_fft if onesided else None, dim=-2, norm='ortho' if normalized else None)[:, offset:offset + win_length]
+    if onesided:
+        x = fft.irfft(x, n=n_fft, dim=-2, norm='ortho' if normalized else 'backward')
+    else:
+        x = fft.ifft(x, n=n_fft, dim=-2, norm='ortho' if normalized else 'backward').real
+    x = x[:, offset:offset + win_length]
 
     x, norm_envelope = _ola(x, hop_length, ola_weight, norm_envelope)
     if center:
         x = x[:, win_length // 2:-win_length // 2]
     return x, norm_envelope
+
+
+def _training_loop(
+        closure,
+        status_dict,
+        target,
+        max_iter,
+        tol,
+        verbose,
+        eva_iter,
+        metric,
+):
+    metric = metric.upper()
+    bar_dict = {}
+    bar_dict[metric] = 0
+    metric_func = _func_mapper[metric]
+
+    criterion = nn.MSELoss()
+    init_loss = None
+
+    with tqdm(total=max_iter, disable=not verbose) as pbar:
+        for i in range(max_iter):
+            output = closure(status_dict)
+            if i % eva_iter == eva_iter - 1:
+                bar_dict[metric] = metric_func(output, target).item()
+                l2_loss = criterion(output, target).item()
+                pbar.set_postfix(**bar_dict, loss=l2_loss)
+                pbar.update(eva_iter)
+
+                if not init_loss:
+                    init_loss = l2_loss
+                elif (previous_loss - l2_loss) / init_loss < tol * eva_iter and previous_loss > l2_loss:
+                    break
+                previous_loss = l2_loss
 
 
 def griffin_lim(spec,
@@ -136,59 +213,49 @@ def griffin_lim(spec,
     assert alpha >= 0
     assert metric.upper() in list(_func_mapper.keys())
 
-    shape = spec.shape
-    assert 4 > len(shape) > 1
-    if len(shape) == 2:
-        spec = spec.unsqueeze(0)
-
-    if not spec.is_complex():
-        cmplx_spec = phase_init(spec, **stft_kwargs)
-        target_spec = spec
-    else:
-        cmplx_spec = spec
-        target_spec = spec.abs()
-
+    cmplx_spec, target_spec = _spec_formatter(spec, **stft_kwargs)
     n_fft, processed_args = _args_helper(target_spec, **stft_kwargs)
-    istft = partial(_istft, n_fft=n_fft, **processed_args)
-    stft_kwargs['return_complex'] = True
+    offset, ola_weight = _get_offset_and_weight(n_fft, **processed_args)
+
+    istft = partial(_istft, n_fft=n_fft, offset=offset, ola_weight=ola_weight,
+                    **processed_args)
 
     pre_spec = cmplx_spec.clone()
     x, norm_envelope = istft(cmplx_spec)
 
-    criterion = nn.MSELoss()
-    init_loss = None
-
-    metric = metric.upper()
-    bar_dict = {}
-    bar_dict[metric] = 0
-    metric_func = _func_mapper[metric]
-
     lr = alpha / (1 + alpha)
 
-    with tqdm(total=max_iter, disable=not verbose) as pbar:
-        for i in range(max_iter):
-            new_spec = torch.stft(x, n_fft, **stft_kwargs)
-            if i % eva_iter == eva_iter - 1:
-                mag = new_spec.abs()
-                bar_dict[metric] = metric_func(mag, target_spec).item()
-                l2_loss = criterion(mag, target_spec).item()
-                pbar.set_postfix(**bar_dict, loss=l2_loss)
-                pbar.update(eva_iter)
+    def closure(status_dict):
+        x = status_dict['x']
+        pre_spec = status_dict['pre_spec']
 
-                if not init_loss:
-                    init_loss = l2_loss
-                elif (previous_loss - l2_loss) / init_loss < tol * eva_iter and previous_loss > l2_loss:
-                    break
-                previous_loss = l2_loss
+        new_spec = torch.stft(x, n_fft, **processed_args)
+        output = new_spec.abs()
+        new_spec = new_spec - pre_spec * lr
+        status_dict['pre_spec'] = new_spec
 
-            new_spec = new_spec - pre_spec * lr
-            # new_spec = new_spec + alpha * (new_spec - pre_spec)
-            pre_spec = new_spec
+        norm = new_spec.abs() + 1e-16
+        new_spec = new_spec * target_spec / norm
+        x, _ = istft(new_spec, norm_envelope=norm_envelope)
+        status_dict['x'] = x
+        return output
 
-            norm = new_spec.abs() + 1e-16
-            new_spec = new_spec * target_spec / norm
-            x, _ = istft(new_spec, norm_envelope=norm_envelope)
+    stats = {
+        'x': x,
+        'pre_spec': pre_spec
+    }
 
+    _training_loop(
+        closure,
+        stats,
+        target_spec,
+        max_iter,
+        tol,
+        verbose,
+        eva_iter,
+        metric
+    )
+    x = stats['x']
     return x.squeeze(0)
 
 
@@ -252,7 +319,7 @@ def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, max_iter=25, alpha=0.
     asym_window1 = target_spec.new_zeros(win_length)
     for i in range(num_keep):
         asym_window1[(i + 1) * hop_length:] += window.flip(0)[:-
-                                                              (i + 1) * hop_length:]
+                                                               (i + 1) * hop_length:]
     asym_window1 *= synth_coeff
 
     asym_window2 = target_spec.new_zeros(win_length)
@@ -313,8 +380,8 @@ def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, max_iter=25, alpha=0.
 
                 norm = new_spec.pow(2).sum(-1).sqrt() + 1e-16
                 new_spec = new_spec * \
-                    (target_spec[..., i:i + look_ahead + 1] /
-                     norm).unsqueeze(-1)
+                           (target_spec[..., i:i + look_ahead + 1] /
+                            norm).unsqueeze(-1)
 
                 update_chunk = irfft(new_spec.transpose(1, 2))
 
@@ -358,22 +425,17 @@ def ADMM(spec, max_iter=1000, tol=1e-6, rho=0.1, verbose=1, eva_iter=10, metric=
         A 1d tensor converted from the given spectrogram
 
     """
-    if spec.shape[-1] != 2:
-        cmplx_spec = phase_init(spec, **stft_kwargs)
-        if len(cmplx_spec.shape) == 3:
-            target_spec = spec.unsqueeze(0)
-            cmplx_spec = cmplx_spec.unsqueeze(0)
-        else:
-            target_spec = spec
-    else:
-        if len(spec.shape) == 3:
-            cmplx_spec = spec.unsqueeze(0)
-        else:
-            cmplx_spec = spec
-        target_spec = cmplx_spec.pow(2).sum(-1).sqrt()
+    assert eva_iter > 0
+    assert max_iter > 0
+    assert tol >= 0
+    assert metric.upper() in list(_func_mapper.keys())
 
+    cmplx_spec, target_spec = _spec_formatter(spec, **stft_kwargs)
     n_fft, processed_args = _args_helper(target_spec, **stft_kwargs)
-    istft = partial(_istft, n_fft=n_fft, **processed_args)
+    offset, ola_weight = _get_offset_and_weight(n_fft, **processed_args)
+
+    istft = partial(_istft, n_fft=n_fft, offset=offset, ola_weight=ola_weight,
+                    **processed_args)
 
     X = cmplx_spec
     x, norm_envelope = istft(X)
@@ -381,51 +443,53 @@ def ADMM(spec, max_iter=1000, tol=1e-6, rho=0.1, verbose=1, eva_iter=10, metric=
     Y = X.clone()
     U = torch.zeros_like(X)
 
-    criterion = nn.MSELoss()
-    init_loss = None
-    bar_dict = {}
-    if metric == 'snr':
-        metric_func = SNR
-        bar_dict['SNR'] = 0
-        metric = metric.upper()
-    elif metric == 'ser':
-        metric_func = SER
-        bar_dict['SER'] = 0
-        metric = metric.upper()
-    else:
-        metric_func = spectral_convergence
-        bar_dict['spectral_convergence'] = 0
-        metric = 'spectral_convergence'
 
-    with tqdm(total=max_iter, disable=not verbose) as pbar:
-        for i in range(max_iter):
-            # Pc2
-            X = Z - U
-            norm = X.pow(2).sum(-1).sqrt() + 1e-16
-            X = X * (target_spec / norm).unsqueeze(-1)
+    def closure(status_dict):
+        X = status_dict['X']
+        Y = status_dict['Y']
+        U = status_dict['U']
+        x = status_dict['x']
 
-            Y = X + U
-            # Pc1
-            x, _ = istft(Y, norm_envelope=norm_envelope)
-            reconstruted = torch.stft(x, n_fft, **stft_kwargs)
+        reconstruted = torch.stft(x, n_fft, **processed_args)
+        output = reconstruted.abs()
 
-            Z = (rho * Y + reconstruted) / (1 + rho)
-            U = U + X - Z
+        Z = (rho * Y + reconstruted) / (1 + rho)
+        U = U + X - Z
 
-            if i % eva_iter == eva_iter - 1:
-                mag = reconstruted.pow(2).sum(-1).sqrt()
-                bar_dict[metric] = metric_func(mag, target_spec).item()
-                l2_loss = criterion(mag, spec).item()
-                pbar.set_postfix(**bar_dict, loss=l2_loss)
-                pbar.update(eva_iter)
+        # Pc2
+        X = Z - U
+        norm = X.abs() + 1e-16
+        X = X * target_spec / norm
 
-                if not init_loss:
-                    init_loss = l2_loss
-                elif (previous_loss - l2_loss) / init_loss < tol * eva_iter and previous_loss > l2_loss:
-                    break
-                previous_loss = l2_loss
+        Y = X + U
+        # Pc1
+        x, _ = istft(Y, norm_envelope=norm_envelope)
 
-    x, _ = istft(Y, norm_envelope=norm_envelope)
+        status_dict['Y'] = Y
+        status_dict['X'] = X
+        status_dict['U'] = U
+        status_dict['x'] = x
+        return output
+
+    stats = {
+        'Y': Y,
+        'U': U,
+        'X': X,
+        'x': x
+    }
+
+    _training_loop(
+        closure,
+        stats,
+        target_spec,
+        max_iter,
+        tol,
+        verbose,
+        eva_iter,
+        metric
+    )
+
+    x = stats['x']
     return x.squeeze(0)
 
 
@@ -522,14 +586,14 @@ def phase_init(spec, **stft_kwargs):
     Returns:
         The estimated complex value spectrogram of size :math:`(N \times T \times 2)`
     """
+    assert not spec.is_complex()
+    shape = spec.shape
+    if len(spec.shape) == 2:
+        spec = spec.unsqueeze(0)
+    assert len(spec.shape) == 3
+
     n_fft, processed_args = _args_helper(spec, **stft_kwargs)
     hop_length = processed_args['hop_length']
-
-    assert not spec.is_complex()
-
-    shape = spec.shape
-    if len(shape) == 2:
-        spec = spec.unsqueeze(0)
 
     phase = torch.zeros_like(spec)
 
