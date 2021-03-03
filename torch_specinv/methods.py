@@ -76,6 +76,11 @@ def _args_helper(spec, **stft_kwargs):
     if window is None:
         window = torch.ones(win_length, dtype=dtype, device=device)
 
+    assert n_fft >= win_length
+    if n_fft > win_length:
+        window = F.pad(window, [(n_fft - win_length) // 2, (n_fft - win_length + 1) // 2])
+        win_length = n_fft
+
     args_dict['win_length'] = win_length
     args_dict['hop_length'] = hop_length
     args_dict['window'] = window
@@ -136,12 +141,9 @@ def _istft(x, n_fft, offset, ola_weight,
         x = fft.irfft(x, n=n_fft, dim=-2, norm='ortho' if normalized else 'backward')
     else:
         x = fft.ifft(x, n=n_fft, dim=-2, norm='ortho' if normalized else 'backward').real
-    x = x[:, offset:offset + win_length]
 
-    x, norm_envelope = _ola(x, hop_length, ola_weight, padding=win_length // 2 if center else 0,
+    x, norm_envelope = _ola(x, hop_length, ola_weight, padding=n_fft // 2 if center else 0,
                             norm_envelope=norm_envelope)
-    if offset and not center:
-        x = F.pad(x, [offset, offset])
     return x, norm_envelope
 
 
