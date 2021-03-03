@@ -294,28 +294,23 @@ def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, max_iter=25, alpha=0.
 
     shape = spec.shape
     assert 4 > len(shape) > 1
-    if len(shape) == 2:
-        spec = spec.unsqueeze(0)
-
     target_spec = spec
+    if len(shape) == 2:
+        target_spec = target_spec.unsqueeze(0)
 
     n_fft, processed_args = _args_helper(target_spec, **stft_kwargs)
+    ola_weight = _get_ola_weight(processed_args['window'])
+
     copyed_kwargs = stft_kwargs.copy()
     copyed_kwargs['center'] = False
 
     win_length = processed_args['win_length']
     hop_length = processed_args['hop_length']
-    offset = processed_args['offset']
     onesided = processed_args['onesided']
     normalized = processed_args['normalized']
-    ola_weight = processed_args['ola_weight']
 
     window = processed_args['window']
-    if window is None:
-        window = torch.diagonal(ola_weight.squeeze())
-        synth_coeff = hop_length / win_length
-    else:
-        synth_coeff = hop_length / window.pow(2).sum()
+    synth_coeff = hop_length / (window @ window)
 
     # ola_weight = ola_weight * synth_coeff
 
@@ -325,58 +320,54 @@ def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, max_iter=25, alpha=0.
 
     asym_window1 = target_spec.new_zeros(win_length)
     for i in range(num_keep):
-        asym_window1[(i + 1) * hop_length:] += window.flip(0)[:-
-                                                               (i + 1) * hop_length:]
+        asym_window1[(i + 1) * hop_length:] += window.flip(0)[:-(i + 1) * hop_length]
     asym_window1 *= synth_coeff
 
     asym_window2 = target_spec.new_zeros(win_length)
     for i in range(num_keep + 1):
-        asym_window2[i *
-                     hop_length:] += window.flip(0)[:-i * hop_length if i else None]
+        asym_window2[i * hop_length:] += window.flip(0)[:-i * hop_length if i else None]
     asym_window2 *= synth_coeff
 
     steps = target_spec.shape[2]
     target_spec = F.pad(target_spec, [look_ahead, look_ahead])
 
-    def irfft(x):
-        return torch.irfft(x, 1, normalized=normalized, onesided=onesided, signal_sizes=[n_fft] if onesided else None)
-
-    def rfft(x):
-        return torch.rfft(x, 1, normalized=normalized, onesided=onesided)
+    if onesided:
+        irfft = partial(fft.irfft, n=n_fft, dim=-2, norm='ortho' if normalized else 'backward')
+        rfft = partial(fft.rfft, n=n_fft, dim=-2, norm='ortho' if normalized else 'backward')
+    else:
+        irfft = lambda x: fft.ifft(x, n=n_fft, dim=-2, norm='ortho' if normalized else 'backward').real
+        rfft = lambda x: fft.fft(x, n=n_fft, dim=-2, norm='ortho' if normalized else 'backward')
 
     # initialize first frame with zero phase
     first_frame = target_spec[..., look_ahead]
-    keeped_chunk = target_spec.new_zeros(target_spec.shape[0], num_keep, n_fft)
-    update_chunk = target_spec.new_zeros(
-        target_spec.shape[0], look_ahead, n_fft)
+    keeped_chunk = target_spec.new_zeros(target_spec.shape[0], n_fft, num_keep)
+    update_chunk = target_spec.new_zeros(target_spec.shape[0], n_fft, look_ahead)
     update_chunk = torch.cat((update_chunk,
-                              irfft(torch.stack((first_frame, torch.zeros_like(first_frame)), -1))[:, None, :]), 1)
+                              irfft(first_frame * (1 + 0j)).unsqueeze(2)), 2)
 
     lr = alpha / (1 + alpha)
     output_xt_list = []
     with tqdm(total=steps + look_ahead, disable=not verbose) as pbar:
         for i in range(steps + look_ahead):
             for j in range(max_iter):
-                x, _ = _ola(torch.cat((keeped_chunk[..., offset:offset + win_length],
-                                       update_chunk[..., offset:offset + win_length]), 1).transpose(1, 2),
+                x, _ = _ola(torch.cat((keeped_chunk,
+                                       update_chunk), 2),
                             hop_length,
-                            ola_weight * synth_coeff, norm_envelope=1)
+                            ola_weight * synth_coeff, padding=0, norm_envelope=1)
 
                 x = x[:, num_keep * hop_length:]
                 if asymmetric_window:
                     xt_winview = x.unfold(1, win_length, hop_length)
-                    xt_norm_wind = xt_winview[:, :-1] * window
+                    xt_norm_wind = xt_winview[:, :, :-1] * window[:, None]
                     if j:
-                        xt_asym_wind = xt_winview[:, -1:] * asym_window2
+                        xt_asym_wind = xt_winview[:, :, -1:] * asym_window2[:, None]
                     else:
-                        xt_asym_wind = xt_winview[:, -1:] * asym_window1
+                        xt_asym_wind = xt_winview[:, :, -1:] * asym_window1[:, None]
 
-                    xt = F.pad(torch.cat((xt_norm_wind, xt_asym_wind), 1), [offset, offset],
-                               mode=stft_kwargs['pad_mode'] if 'pad_mode' in stft_kwargs.keys() else 'constant')
-                    new_spec = rfft(xt).transpose(1, 2)
+                    xt = torch.cat((xt_norm_wind, xt_asym_wind), 2)
+                    new_spec = rfft(xt)
                 else:
-                    new_spec = torch.stft(F.pad(x, [0, offset]),
-                                          n_fft=n_fft, **copyed_kwargs)
+                    new_spec = torch.stft(x, n_fft=n_fft, **copyed_kwargs)
 
                 if j:
                     new_spec = new_spec - lr * pre_spec
@@ -385,26 +376,22 @@ def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, max_iter=25, alpha=0.
                         (new_spec[:, :, :-1] - lr * pre_spec[:, :, 1:], new_spec[:, :, -1:]), 2)
                 pre_spec = new_spec
 
-                norm = new_spec.pow(2).sum(-1).sqrt() + 1e-16
-                new_spec = new_spec * \
-                           (target_spec[..., i:i + look_ahead + 1] /
-                            norm).unsqueeze(-1)
+                norm = new_spec.abs() + 1e-16
+                new_spec = new_spec * target_spec[..., i:i + look_ahead + 1] / norm
 
-                update_chunk = irfft(new_spec.transpose(1, 2))
+                update_chunk = irfft(new_spec)
 
             pbar.update()
-            output_xt_list.append(
-                update_chunk[:, 0, offset:offset + win_length])
-            keeped_chunk = torch.cat(
-                (keeped_chunk[:, 1:], update_chunk[:, :1]), 1)
-            update_chunk = F.pad(update_chunk[:, 1:], [0, 0, 0, 1])
+            output_xt_list.append(update_chunk[:, :, 0])
+            keeped_chunk = torch.cat((keeped_chunk[:, :, 1:], update_chunk[:, :, :1]), 2)
+            update_chunk = F.pad(update_chunk[:, :, 1:], [0, 1])
 
     all_xt = torch.stack(output_xt_list[look_ahead if look_ahead else 0:], 2)
-    x, _ = _ola(all_xt, hop_length, ola_weight)
-    if processed_args['center']:
-        x = x[:, win_length // 2:-win_length // 2]
+    x, _ = _ola(all_xt, hop_length, ola_weight, padding=win_length // 2 if processed_args['center'] else 0)
 
-    return x.squeeze(0)
+    if not (spec.shape[0] == 1 and len(spec.shape) == 3):
+        x = x.squeeze(0)
+    return x
 
 
 def ADMM(spec, max_iter=1000, tol=1e-6, rho=0.1, verbose=1, eva_iter=10, metric='sc', **stft_kwargs):
