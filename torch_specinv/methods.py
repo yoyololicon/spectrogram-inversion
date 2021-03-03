@@ -90,10 +90,9 @@ def _args_helper(spec, **stft_kwargs):
     return n_fft, args_dict
 
 
-def _get_offset_and_weight(n_fft, **stft_kwargs):
-    offset = (n_fft - stft_kwargs['win_length']) // 2
-    ola_weight = torch.diag(stft_kwargs['window']).unsqueeze(1)
-    return offset, ola_weight
+def _get_ola_weight(window):
+    ola_weight = torch.diag(window).unsqueeze(1)
+    return ola_weight
 
 
 def _spec_formatter(spec, **stft_kwargs):
@@ -131,7 +130,7 @@ def _ola(x, hop_length, weight, padding, norm_envelope=None):
     return ola_x / norm_envelope, norm_envelope
 
 
-def _istft(x, n_fft, offset, ola_weight,
+def _istft(x, n_fft, ola_weight,
            win_length, window, hop_length, center, normalized, onesided, pad_mode, return_complex,
            norm_envelope=None):
     """
@@ -221,9 +220,9 @@ def griffin_lim(spec,
 
     cmplx_spec, target_spec = _spec_formatter(spec, **stft_kwargs)
     n_fft, processed_args = _args_helper(target_spec, **stft_kwargs)
-    offset, ola_weight = _get_offset_and_weight(n_fft, **processed_args)
+    ola_weight = _get_ola_weight(processed_args['window'])
 
-    istft = partial(_istft, n_fft=n_fft, offset=offset, ola_weight=ola_weight,
+    istft = partial(_istft, n_fft=n_fft, ola_weight=ola_weight,
                     **processed_args)
 
     pre_spec = cmplx_spec.clone()
@@ -440,9 +439,9 @@ def ADMM(spec, max_iter=1000, tol=1e-6, rho=0.1, verbose=1, eva_iter=10, metric=
 
     cmplx_spec, target_spec = _spec_formatter(spec, **stft_kwargs)
     n_fft, processed_args = _args_helper(target_spec, **stft_kwargs)
-    offset, ola_weight = _get_offset_and_weight(n_fft, **processed_args)
+    ola_weight = _get_ola_weight(processed_args['window'])
 
-    istft = partial(_istft, n_fft=n_fft, offset=offset, ola_weight=ola_weight,
+    istft = partial(_istft, n_fft=n_fft, ola_weight=ola_weight,
                     **processed_args)
 
     X = cmplx_spec
