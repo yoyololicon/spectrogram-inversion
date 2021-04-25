@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import pytest
-from torch_specinv.methods import griffin_lim
+from torch_specinv.methods import RTISI_LA
 
 from .consts import nfft_list
 
@@ -13,7 +13,7 @@ from .consts import nfft_list
 def test_empty_args(x_sizes, device, dtype, nfft):
     x = torch.randn(*x_sizes, device=device, dtype=dtype)
     spec = torch.stft(x, nfft, return_complex=True)
-    y = griffin_lim(spec.abs(), max_iter=4)
+    y = RTISI_LA(spec.abs(), max_iter=4)
     assert len(y.shape) == len(x.shape)
     if len(y.shape) > 1:
         assert y.shape[0] == x.shape[0]
@@ -21,6 +21,8 @@ def test_empty_args(x_sizes, device, dtype, nfft):
     return
 
 
+@pytest.mark.parametrize("look_ahead", [-1, 2])
+@pytest.mark.parametrize("asymmetric_window", [True, False])
 @pytest.mark.parametrize("win_length, window", [(None, None),
                                                 (300, None),
                                                 (300, torch.hann_window(300))])
@@ -31,6 +33,8 @@ def test_empty_args(x_sizes, device, dtype, nfft):
 @pytest.mark.parametrize("pad_mode", ["reflect", "constant", "replicate", "circular"])
 @pytest.mark.parametrize("return_complex", [True, False])
 def test_stft_args(
+        look_ahead,
+        asymmetric_window,
         win_length,
         window,
         hop_length,
@@ -52,15 +56,15 @@ def test_stft_args(
                       return_complex=True).abs()
 
     spec.requires_grad = True
-    y = griffin_lim(spec, max_iter=2,
-                    hop_length=hop_length,
-                    win_length=win_length,
-                    window=window,
-                    center=center,
-                    pad_mode=pad_mode,
-                    normalized=normalized,
-                    onesided=onesided,
-                    return_complex=return_complex)
+    y = RTISI_LA(spec, max_iter=2, look_ahead=look_ahead, asymmetric_window=asymmetric_window,
+                 hop_length=hop_length,
+                 win_length=win_length,
+                 window=window,
+                 center=center,
+                 pad_mode=pad_mode,
+                 normalized=normalized,
+                 onesided=onesided,
+                 return_complex=return_complex)
 
     loss = F.mse_loss(x[:y.shape[0]], y)
     loss.backward()

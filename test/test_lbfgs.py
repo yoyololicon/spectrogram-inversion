@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import pytest
-from torch_specinv.methods import griffin_lim
+from torch_specinv.methods import L_BFGS
 
 from .consts import nfft_list
 
@@ -12,8 +12,13 @@ from .consts import nfft_list
 @pytest.mark.parametrize("nfft", nfft_list)
 def test_empty_args(x_sizes, device, dtype, nfft):
     x = torch.randn(*x_sizes, device=device, dtype=dtype)
-    spec = torch.stft(x, nfft, return_complex=True)
-    y = griffin_lim(spec.abs(), max_iter=4)
+
+    def trsfn(x):
+        return torch.stft(x, nfft, return_complex=True).abs()
+    
+    spec = trsfn(x)
+
+    y = L_BFGS(spec, trsfn, max_iter=4)
     assert len(y.shape) == len(x.shape)
     if len(y.shape) > 1:
         assert y.shape[0] == x.shape[0]
@@ -52,7 +57,7 @@ def test_stft_args(
                       return_complex=True).abs()
 
     spec.requires_grad = True
-    y = griffin_lim(spec, max_iter=2,
+    y = L_BFGS(spec, max_iter=2,
                     hop_length=hop_length,
                     win_length=win_length,
                     window=window,
