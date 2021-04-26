@@ -594,11 +594,9 @@ def phase_init(spec, **stft_kwargs):
 
     phase = torch.zeros_like(spec)
 
-    def peak_picking(x):
-        mask = (x[:, 1:-1] > x[:, 2:]) & (x[:, 1:-1] > x[:, :-2])
-        return F.pad(mask, [0, 0, 1, 1])
+    mask = (spec[:, 1:-1] > spec[:, 2:]) & (spec[:, 1:-1] > spec[:, :-2])
+    mask = F.pad(mask, [0, 0, 1, 1])
 
-    mask = peak_picking(spec)
     b = torch.masked_select(spec, mask)
     a = torch.masked_select(spec[:, :-1], mask[:, 1:])
     r = torch.masked_select(spec[:, 1:], mask[:, :-1])
