@@ -1,22 +1,28 @@
+from .metrics import *
 import torch
 import torch.nn as nn
+import torch.fft as fft
 import torch.nn.functional as F
 from torch.optim.lbfgs import LBFGS
 from tqdm import tqdm
 from functools import partial
+from typing import Tuple
 import math
-import heapq
 
 pi2 = 2 * math.pi
 
-from .metrics import spectral_convergence, SNR, SER
+_func_mapper = {
+    'SC': sc,
+    'SNR': snr,
+    'SER': ser
+}
 
 
-def _args_helper(spec: torch.Tensor, **stft_kwargs) -> (int, dict):
+def _args_helper(spec, **stft_kwargs):
     """A helper function to get stft arguments from the provided kwargs.
 
     Args:
-        spec: The magnitude spectrum of size (freq x time).
+        spec: The magnitude spectrum of size (*, freq, time).
         **stft_kwargs: Keyword arguments that computed spec from 'torch.stft'.
         See `torch.stft` for details.
 
@@ -25,21 +31,41 @@ def _args_helper(spec: torch.Tensor, **stft_kwargs) -> (int, dict):
         processed_kwargs: Dict object that stored the processed keyword arguments.
 
     """
-    device = spec.device
-    dtype = spec.dtype
-    args_dict = {'win_length': None, 'window': None, 'hop_length': None, 'center': True, 'normalized': False,
-                 'onesided': True}
+    args_dict = {'win_length': None,
+                 'window': None,
+                 'hop_length': None,
+                 'center': True,
+                 'pad_mode': 'reflect',
+                 'normalized': False,
+                 'onesided': None,
+                 'return_complex': None}
     for key, item in args_dict.items():
         try:
             args_dict[key] = stft_kwargs[key]
         except:
             pass
-    win_length, window, hop_length, center, normalized, onesided = tuple(args_dict.values())
+    win_length, window, hop_length, center, pad_mode, normalized, onesided, return_complex = tuple(
+        args_dict.values())
+
+    device = spec.device
+    dtype = spec.dtype
+    if dtype == torch.complex32:
+        dtype = torch.float16
+    elif dtype == torch.complex64:
+        dtype = torch.float32
+    elif dtype == torch.complex128:
+        dtype = torch.float64
+
+    if onesided is None:
+        if window is not None and window.is_complex():
+            onesided = False
+        else:
+            onesided = True
 
     if onesided:
-        n_fft = (spec.shape[0] - 1) * 2
+        n_fft = (spec.shape[-2] - 1) * 2
     else:
-        n_fft = spec.shape[0]
+        n_fft = spec.shape[-2]
 
     if not win_length:
         win_length = n_fft
@@ -48,57 +74,130 @@ def _args_helper(spec: torch.Tensor, **stft_kwargs) -> (int, dict):
         hop_length = n_fft // 4
 
     if window is None:
-        coeff = hop_length / win_length
-    else:
-        coeff = hop_length / window.pow(2).sum()
+        window = torch.ones(win_length, dtype=dtype, device=device)
 
-    offset = (n_fft - win_length) // 2
-    conv_weight = torch.eye(win_length, dtype=dtype, device=device).unsqueeze(1)
+    assert n_fft >= win_length
+    if n_fft > win_length:
+        window = F.pad(window, [(n_fft - win_length) //
+                                2, (n_fft - win_length + 1) // 2])
+        win_length = n_fft
 
     args_dict['win_length'] = win_length
     args_dict['hop_length'] = hop_length
-    args_dict['synth_coeff'] = coeff
-    args_dict['ola_weight'] = conv_weight
-    args_dict['offset'] = offset
+    args_dict['window'] = window
+    args_dict['return_complex'] = True
+    args_dict['onesided'] = onesided
+
     return n_fft, args_dict
 
 
-def _ola(x: torch.Tensor, window: torch.Tensor, hop_length: int, synth_coeff: float,
-         weight: torch.Tensor) -> torch.Tensor:
+def _get_ola_weight(window):
+    ola_weight = torch.diag(window).unsqueeze(1)
+    return ola_weight
+
+
+def _spec_formatter(spec, **stft_kwargs):
+    shape = spec.shape
+    assert 4 > len(shape) > 1
+    if len(shape) == 2:
+        spec = spec.unsqueeze(0)
+
+    if not spec.is_complex():
+        cmplx_spec = phase_init(spec, **stft_kwargs)
+        target_spec = spec
+    else:
+        cmplx_spec = spec
+        target_spec = spec.abs()
+    return cmplx_spec, target_spec
+
+
+def _ola(x, hop_length, weight, padding, norm_envelope=None):
     """A helper function to do overlap-and-add.
 
     Args:
-        x: input tensor of size :math: '(window_size, time)'.
-        window: The window function. If ''None'' will treated as window of all :math:`1` s.
+        x: input tensor of size :math: '(batch, window_size, time)'.
         hop_length: The distance between neighboring sliding window frames.
-        synth_coeff: The normalized coefficient apply on synthesis window.
         weight: An identity matrix of size (win_length x win_length) .
+        norm_envelope: The normalized coefficient apply on synthesis window.
 
     Returns:
         A 1d tensor containing the overlap-and-add result.
 
     """
-    if window is not None:
-        x = x * window.unsqueeze(-1)
-    return F.conv_transpose1d((x * synth_coeff).unsqueeze(0), weight, stride=hop_length).view(-1)
+    ola_x = F.conv_transpose1d(
+        x, weight, stride=hop_length, padding=padding).squeeze(1)
+    if norm_envelope is None:
+        norm_envelope = F.conv_transpose1d(torch.ones_like(
+            x[:1]), weight * weight, stride=hop_length, padding=padding).squeeze()
+    return ola_x / norm_envelope, norm_envelope
 
 
-def _istft(x, n_fft, win_length, window, hop_length, center, normalized, onesided, synth_coeff, offset, ola_weight):
+def _istft(x, n_fft, ola_weight,
+           win_length, window, hop_length, center, normalized, onesided, pad_mode, return_complex,
+           norm_envelope=None):
     """
     A helper function to do istft.
     """
-    x = torch.irfft(x.transpose(0, 1), 1, normalized=normalized, onesided=onesided,
-                    signal_sizes=[n_fft] if onesided else None)[:, offset:offset + win_length]
+    if onesided:
+        x = fft.irfft(x, n=n_fft, dim=-2,
+                      norm='ortho' if normalized else 'backward')
+    else:
+        x = fft.ifft(x, n=n_fft, dim=-2,
+                     norm='ortho' if normalized else 'backward').real
 
-    x = x.t()
-    x = _ola(x, window, hop_length, synth_coeff, ola_weight)
-    if center:
-        x = x[win_length // 2:-win_length // 2]
-    return x
+    x, norm_envelope = _ola(x, hop_length, ola_weight, padding=n_fft // 2 if center else 0,
+                            norm_envelope=norm_envelope)
+    return x, norm_envelope
 
 
-def griffin_lim(spec, maxiter: int = 200, tol: float = 1e-6, alpha: float = 0.99, verbose: bool = True,
-                evaiter: int = 10, metric='sc', **stft_kwargs):
+def _training_loop(
+        closure,
+        status_dict,
+        target,
+        max_iter,
+        tol,
+        verbose,
+        eva_iter,
+        metric,
+):
+    assert eva_iter > 0
+    assert max_iter > 0
+    assert tol >= 0
+
+    metric = metric.upper()
+    assert metric.upper() in _func_mapper.keys()
+
+    bar_dict = {}
+    bar_dict[metric] = 0
+    metric_func = _func_mapper[metric]
+
+    criterion = F.mse_loss
+    init_loss = None
+
+    with tqdm(total=max_iter, disable=not verbose) as pbar:
+        for i in range(max_iter):
+            output = closure(status_dict)
+            if i % eva_iter == eva_iter - 1:
+                bar_dict[metric] = metric_func(output, target).item()
+                l2_loss = criterion(output, target).item()
+                pbar.set_postfix(**bar_dict, loss=l2_loss)
+                pbar.update(eva_iter)
+
+                if not init_loss:
+                    init_loss = l2_loss
+                elif (previous_loss - l2_loss) / init_loss < tol and previous_loss > l2_loss:
+                    break
+                previous_loss = l2_loss
+
+
+def griffin_lim(spec,
+                max_iter=200,
+                tol=1e-6,
+                alpha=0.99,
+                verbose=True,
+                eva_iter=10,
+                metric='sc',
+                **stft_kwargs):
     r"""Reconstruct spectrogram phase using the will known `Griffin-Lim`_ algorithm and its variation, `Fast Griffin-Lim`_.
 
 
@@ -109,11 +208,11 @@ def griffin_lim(spec, maxiter: int = 200, tol: float = 1e-6, alpha: float = 0.99
         spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude) or :math:`(N \times T \times 2)`
             (complex input). If a magnitude spectrogram is given, the phase will first be intialized using
             :func:`torch_specinv.methods.phase_init`; otherwise start from the complex input.
-        maxiter (int): maximum number of iterations before timing out.
+        max_iter (int): maximum number of iterations before timing out.
         tol (float): tolerance of the stopping condition base on L2 loss. Default: ``1e-6``
         alpha (float): speedup parameter used in `Fast Griffin-Lim`_, set it to zero will disable it. Default: ``0``
         verbose (bool): whether to be verbose. Default: :obj:`True`
-        evaiter (int): steps size for evaluation. After each step, the function defined in `metric` will evaluate. Default: ``10``
+        eva_iter (int): steps size for evaluation. After each step, the function defined in `metric` will evaluate. Default: ``10``
         metric (str): evaluation function. Currently available functions: ``'sc'`` (spectral convergence), ``'snr'`` or ``'ser'``. Default: ``'sc'``
         **stft_kwargs: other arguments that pass to :func:`torch.stft`
 
@@ -121,59 +220,57 @@ def griffin_lim(spec, maxiter: int = 200, tol: float = 1e-6, alpha: float = 0.99
         A 1d tensor converted from the given spectrogram
 
     """
-    n_fft, proccessed_args = _args_helper(spec, **stft_kwargs)
+    assert alpha >= 0
 
-    istft = partial(_istft, n_fft=n_fft, **proccessed_args)
+    cmplx_spec, target_spec = _spec_formatter(spec, **stft_kwargs)
+    n_fft, processed_args = _args_helper(target_spec, **stft_kwargs)
+    ola_weight = _get_ola_weight(processed_args['window'])
 
-    if len(spec.shape) == 2:
-        new_spec = phase_init(spec, **stft_kwargs)
-    else:
-        new_spec = torch.stack((spec, torch.zeros_like(spec)), 2)
-    pre_spec = new_spec.clone()
-    x = istft(new_spec)
+    istft = partial(_istft, n_fft=n_fft, ola_weight=ola_weight,
+                    **processed_args)
 
-    criterion = nn.MSELoss()
-    init_loss = None
-    bar_dict = {}
-    if metric == 'snr':
-        metric_func = SNR
-        bar_dict['SNR'] = 0
-        metric = metric.upper()
-    elif metric == 'ser':
-        metric_func = SER
-        bar_dict['SER'] = 0
-        metric = metric.upper()
-    else:
-        metric_func = spectral_convergence
-        bar_dict['spectral_convergence'] = 0
-        metric = 'spectral_convergence'
+    pre_spec = cmplx_spec.clone()
+    x, norm_envelope = istft(cmplx_spec)
 
-    with tqdm(total=maxiter, disable=not verbose) as pbar:
-        for i in range(maxiter):
-            new_spec[:] = torch.stft(x, n_fft, **stft_kwargs)
-            new_spec += alpha * (new_spec - pre_spec)
-            pre_spec.copy_(new_spec)
+    lr = alpha / (1 + alpha)
 
-            mag = new_spec.pow(2).sum(2).sqrt()
-            new_spec *= (spec / F.threshold_(mag, 1e-7, 1e-7)).unsqueeze(-1)
-            x[:] = istft(new_spec)
+    def closure(status_dict):
+        x = status_dict['x']
+        pre_spec = status_dict['pre_spec']
 
-            if i % evaiter == evaiter - 1:
-                bar_dict[metric] = metric_func(mag, spec).item()
-                l2_loss = criterion(mag, spec).item()
-                pbar.set_postfix(**bar_dict, loss=l2_loss)
-                pbar.update(evaiter)
+        new_spec = torch.stft(x, n_fft, **processed_args)
+        output = new_spec.abs()
+        new_spec = new_spec - pre_spec * lr
+        status_dict['pre_spec'] = new_spec
 
-                if not init_loss:
-                    init_loss = l2_loss
-                elif (previous_loss - l2_loss) / init_loss < tol * evaiter and previous_loss > l2_loss:
-                    break
-                previous_loss = l2_loss
+        norm = new_spec.abs().add_(1e-16)
+        new_spec = new_spec * target_spec / norm
+        x, _ = istft(new_spec, norm_envelope=norm_envelope)
+        status_dict['x'] = x
+        return output
 
+    stats = {
+        'x': x,
+        'pre_spec': pre_spec
+    }
+
+    _training_loop(
+        closure,
+        stats,
+        target_spec,
+        max_iter,
+        tol,
+        verbose,
+        eva_iter,
+        metric
+    )
+    x = stats['x']
+    if not (spec.shape[0] == 1 and len(spec.shape) == 3):
+        x = x.squeeze(0)
     return x
 
 
-def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, maxiter=25, alpha=0.99, verbose=1, **stft_kwargs):
+def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, max_iter=25, alpha=0.99, verbose=1, **stft_kwargs):
     r"""
     Reconstruct spectrogram phase using `Real-Time Iterative Spectrogram Inversion with Look Ahead`_ (RTISI-LA).
 
@@ -186,7 +283,7 @@ def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, maxiter=25, alpha=0.9
         look_ahead (int): how many future frames will be consider. ``-1`` will set it to ``(win_length - 1) / hop_length``,
             ``0`` will disable look-ahead strategy and fall back to original RTISI algorithm. Default: ``-1``
         asymmetric_window (bool): whether to apply asymmetric window on the first iteration for new coming frame.
-        maxiter (int): number of iterations for each step.
+        max_iter (int): number of iterations for each step.
         alpha (float): speedup parameter used in `Fast Griffin-Lim`_, set it to zero will disable it. Default: ``0``
         verbose (bool): whether to be verbose. Default: :obj:`True`
         **stft_kwargs: other arguments that pass to :func:`torch.stft`.
@@ -195,98 +292,127 @@ def RTISI_LA(spec, look_ahead=-1, asymmetric_window=False, maxiter=25, alpha=0.9
         A 1d tensor converted from the given spectrogram
 
     """
-    n_fft, proccessed_args = _args_helper(spec, **stft_kwargs)
+    assert max_iter > 0
+    assert alpha >= 0
+    assert not spec.is_complex()
+
+    shape = spec.shape
+    assert 4 > len(shape) > 1
+    target_spec = spec
+    if len(shape) == 2:
+        target_spec = target_spec.unsqueeze(0)
+
+    n_fft, processed_args = _args_helper(target_spec, **stft_kwargs)
+    ola_weight = _get_ola_weight(processed_args['window'])
+
     copyed_kwargs = stft_kwargs.copy()
     copyed_kwargs['center'] = False
+    copyed_kwargs['return_complex'] = True
 
-    win_length = proccessed_args['win_length']
-    hop_length = proccessed_args['hop_length']
-    synth_coeff = proccessed_args['synth_coeff']
-    offset = proccessed_args['offset']
-    onesided = proccessed_args['onesided']
-    normalized = proccessed_args['normalized']
-    ola_weight = proccessed_args['ola_weight']
-    window = proccessed_args['window']
-    if window is None:
-        window = torch.hann_window(win_length).to(spec.device)
+    win_length = processed_args['win_length']
+    hop_length = processed_args['hop_length']
+    onesided = processed_args['onesided']
+    normalized = processed_args['normalized']
+
+    window = processed_args['window']
+    synth_coeff = hop_length / (window @ window)
+
+    # ola_weight = ola_weight * synth_coeff
 
     num_keep = (win_length - 1) // hop_length
     if look_ahead < 0:
         look_ahead = num_keep
 
-    asym_window1 = spec.new_zeros(win_length)
+    asym_window1 = target_spec.new_zeros(win_length)
     for i in range(num_keep):
-        asym_window1[(i + 1) * hop_length:] += window.flip(0)[:-(i + 1) * hop_length:]
-    asym_window1 *= hop_length / (asym_window1 * window).sum() / synth_coeff
+        asym_window1[(i + 1) * hop_length:] += window.flip(0)[:-
+                                                              (i + 1) * hop_length]
+    asym_window1 *= synth_coeff
 
-    asym_window2 = spec.new_zeros(win_length)
+    asym_window2 = target_spec.new_zeros(win_length)
     for i in range(num_keep + 1):
-        asym_window2[i * hop_length:] += window.flip(0)[:-i * hop_length if i else None]
-    asym_window2 *= hop_length / (asym_window2 * window).sum() / synth_coeff
+        asym_window2[i *
+                     hop_length:] += window.flip(0)[:-i * hop_length if i else None]
+    asym_window2 *= synth_coeff
 
-    steps = spec.shape[1]
-    xt = spec.new_zeros(steps + num_keep + 2 * look_ahead, n_fft)
-    xt_winview = xt[:, offset:offset + win_length]
-    spec = F.pad(spec, [look_ahead, look_ahead])
+    steps = target_spec.shape[2]
+    target_spec = F.pad(target_spec, [look_ahead, look_ahead])
 
-    def irfft(x):
-        return torch.irfft(x, 1, normalized=normalized, onesided=onesided, signal_sizes=[n_fft] if onesided else None)
-
-    def rfft(x):
-        return torch.rfft(x, 1, normalized=normalized, onesided=onesided)
+    if onesided:
+        irfft = partial(fft.irfft, n=n_fft, dim=-2,
+                        norm='ortho' if normalized else 'backward')
+        rfft = partial(fft.rfft, n=n_fft, dim=-2,
+                       norm='ortho' if normalized else 'backward')
+    else:
+        def irfft(x): return fft.ifft(x, n=n_fft, dim=-2,
+                                      norm='ortho' if normalized else 'backward').real
+        def rfft(x): return fft.fft(x, n=n_fft, dim=-2,
+                                    norm='ortho' if normalized else 'backward')
 
     # initialize first frame with zero phase
-    first_frame = spec[:, look_ahead]
-    xt_winview[num_keep + look_ahead] = irfft(torch.stack((first_frame, torch.zeros_like(first_frame)), -1))[
-                                        offset:offset + win_length]
+    first_frame = target_spec[..., look_ahead, None]
+    keeped_chunk = target_spec.new_zeros(target_spec.shape[0], n_fft, num_keep)
+    update_chunk = target_spec.new_zeros(
+        target_spec.shape[0], n_fft, look_ahead)
+    update_chunk = torch.cat((update_chunk,
+                              irfft(first_frame + 0j)), 2)
 
+    lr = alpha / (1 + alpha)
+    output_xt_list = []
     with tqdm(total=steps + look_ahead, disable=not verbose) as pbar:
         for i in range(steps + look_ahead):
-            for j in range(maxiter):
-                x = _ola(xt_winview[i:i + num_keep + look_ahead + 1].t(), window, hop_length, synth_coeff, ola_weight)
+            for j in range(max_iter):
+                x, _ = _ola(torch.cat((keeped_chunk,
+                                       update_chunk), 2),
+                            hop_length,
+                            ola_weight * synth_coeff, padding=0, norm_envelope=1)
+
+                x = x[:, num_keep * hop_length:]
                 if asymmetric_window:
-                    xt_winview[i + num_keep:i + num_keep + look_ahead + 1] = \
-                        x.unfold(0, win_length, hop_length)[num_keep:]
-
-                    xt_winview[i + num_keep:i + num_keep + look_ahead] *= window
+                    xt_winview = x.unfold(
+                        1, win_length, hop_length).transpose(1, 2)
+                    xt_norm_wind = xt_winview[:, :, :-1] * window[:, None]
                     if j:
-                        xt_winview[i + num_keep + look_ahead] *= asym_window2
+                        xt_asym_wind = xt_winview[:,
+                                                  :, -1:] * asym_window2[:, None]
                     else:
-                        xt_winview[i + num_keep + look_ahead] *= asym_window1
+                        xt_asym_wind = xt_winview[:,
+                                                  :, -1:] * asym_window1[:, None]
 
-                    new_spec = rfft(xt[i + num_keep:i + num_keep + look_ahead + 1]).transpose(0, 1)
+                    xt = torch.cat((xt_norm_wind, xt_asym_wind), 2)
+                    new_spec = rfft(xt)
                 else:
-                    new_spec = torch.stft(F.pad(x[num_keep * hop_length - offset:], [0, offset]),
-                                          n_fft=n_fft, **copyed_kwargs)
+                    new_spec = torch.stft(x, n_fft=n_fft, **copyed_kwargs)
 
                 if j:
-                    new_spec += alpha * (new_spec - pre_spec)
-                    pre_spec.copy_(new_spec)
+                    new_spec = new_spec - lr * pre_spec
                 elif i:
-                    new_spec[:, :-1] += alpha * (new_spec[:, :-1] - pre_spec[:, 1:])
-                    pre_spec.copy_(new_spec)
-                else:
-                    pre_spec = new_spec.clone()
+                    new_spec = torch.cat(
+                        (new_spec[:, :, :-1] - lr * pre_spec[:, :, 1:], new_spec[:, :, -1:]), 2)
+                pre_spec = new_spec
 
-                mag = F.threshold_(new_spec.pow(2).sum(2).sqrt(), 1e-7, 1e-7)
-                new_spec *= (spec[:, i:i + look_ahead + 1] / mag).unsqueeze(-1)
+                norm = new_spec.abs() + 1e-16
+                new_spec = new_spec * \
+                    target_spec[..., i:i + look_ahead + 1] / norm
 
-                xt_winview[i + num_keep:i + num_keep + look_ahead + 1] = irfft(new_spec.transpose(0, 1))[:,
-                                                                         offset:offset + win_length]
+                update_chunk = irfft(new_spec)
 
             pbar.update()
+            output_xt_list.append(update_chunk[:, :, 0])
+            keeped_chunk = torch.cat(
+                (keeped_chunk[:, :, 1:], update_chunk[:, :, :1]), 2)
+            update_chunk = F.pad(update_chunk[:, :, 1:], [0, 1])
 
-    x = _ola(xt_winview[num_keep + look_ahead:-look_ahead if look_ahead else None].t(), window, hop_length, synth_coeff,
-             ola_weight)
-    if proccessed_args['center']:
-        x = x[win_length // 2:-win_length // 2]
-    else:
-        x = F.pad(x, [offset, offset])
+    all_xt = torch.stack(output_xt_list[look_ahead if look_ahead else 0:], 2)
+    x, _ = _ola(all_xt, hop_length, ola_weight, padding=win_length //
+                2 if processed_args['center'] else 0)
 
+    if not (spec.shape[0] == 1 and len(spec.shape) == 3):
+        x = x.squeeze(0)
     return x
 
 
-def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, verbose=1, evaiter=10, metric='sc', **stft_kwargs):
+def ADMM(spec, max_iter=1000, tol=1e-6, rho=0.1, verbose=1, eva_iter=10, metric='sc', **stft_kwargs):
     r"""
     Reconstruct spectrogram phase using `Griffin–Lim Like Phase Recovery via Alternating Direction Method of Multipliers`_ .
 
@@ -297,12 +423,12 @@ def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, verbose=1, evaiter=10, metric='s
         spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude) or :math:`(N \times T \times 2)`
             (complex input). If a magnitude spectrogram is given, the phase will first be intialized using
             :func:`torch_specinv.methods.phase_init`; otherwise start from the complex input.
-        maxiter (int): maximum number of iterations before timing out.
+        max_iter (int): maximum number of iterations before timing out.
         tol (float): tolerance of the stopping condition base on L2 loss. Default: ``1e-6``
         rho (float): non-negative speedup parameter. Small value is preferable when the input spectrogram is noisy (inperfect);
             set it to 1 will behave similar to ``griffin_lim``.  Default: ``0.1``
         verbose (bool): whether to be verbose. Default: :obj:`True`
-        evaiter (int): steps size for evaluation. After each step, the function defined in ``metric`` will evaluate. Default: ``10``
+        eva_iter (int): steps size for evaluation. After each step, the function defined in ``metric`` will evaluate. Default: ``10``
         metric (str): evaluation function. Currently available functions: ``'sc'`` (spectral convergence), ``'snr'`` or ``'ser'``. Default: ``'sc'``
         **stft_kwargs: other arguments that pass to :func:`torch.stft`.
 
@@ -311,68 +437,76 @@ def ADMM(spec, maxiter=1000, tol=1e-6, rho=0.1, verbose=1, evaiter=10, metric='s
         A 1d tensor converted from the given spectrogram
 
     """
-    n_fft, proccessed_args = _args_helper(spec, **stft_kwargs)
+    assert eva_iter > 0
+    assert max_iter > 0
+    assert tol >= 0
+    assert metric.upper() in list(_func_mapper.keys())
 
-    istft = partial(_istft, n_fft=n_fft, **proccessed_args)
+    cmplx_spec, target_spec = _spec_formatter(spec, **stft_kwargs)
+    n_fft, processed_args = _args_helper(target_spec, **stft_kwargs)
+    ola_weight = _get_ola_weight(processed_args['window'])
 
-    if len(spec.shape) == 2:
-        X = phase_init(spec, **stft_kwargs)
-    else:
-        X = torch.stack((spec, torch.zeros_like(spec)), 2)
+    istft = partial(_istft, n_fft=n_fft, ola_weight=ola_weight,
+                    **processed_args)
 
-    x = istft(X)
+    X = cmplx_spec
+    x, norm_envelope = istft(X)
     Z = X.clone()
     Y = X.clone()
     U = torch.zeros_like(X)
 
-    criterion = nn.MSELoss()
-    init_loss = None
-    bar_dict = {}
-    if metric == 'snr':
-        metric_func = SNR
-        bar_dict['SNR'] = 0
-        metric = metric.upper()
-    elif metric == 'ser':
-        metric_func = SER
-        bar_dict['SER'] = 0
-        metric = metric.upper()
-    else:
-        metric_func = spectral_convergence
-        bar_dict['spectral_convergence'] = 0
-        metric = 'spectral_convergence'
+    def closure(status_dict):
+        X = status_dict['X']
+        Y = status_dict['Y']
+        U = status_dict['U']
+        x = status_dict['x']
 
-    with tqdm(total=maxiter, disable=not verbose) as pbar:
-        for i in range(maxiter):
-            # Pc2
-            X[:] = Z - U
-            mag = X.pow(2).sum(2).sqrt()
-            X *= (spec / F.threshold_(mag, 1e-7, 1e-7)).unsqueeze(-1)
+        reconstruted = torch.stft(x, n_fft, **processed_args)
+        output = reconstruted.abs()
 
-            Y[:] = X + U
-            # Pc1
-            x[:] = istft(Y)
-            reconstruted = torch.stft(x, n_fft, **stft_kwargs)
+        Z = (rho * Y + reconstruted) / (1 + rho)
+        U = U + X - Z
 
-            Z[:] = (rho * Y + reconstruted) / (1 + rho)
-            U += X - Z
+        # Pc2
+        X = Z - U
+        norm = X.abs() + 1e-16
+        X = X * target_spec / norm
 
-            if i % evaiter == evaiter - 1:
-                mag = reconstruted.pow(2).sum(2).sqrt()
-                bar_dict[metric] = metric_func(mag, spec).item()
-                l2_loss = criterion(mag, spec).item()
-                pbar.set_postfix(**bar_dict, loss=l2_loss)
-                pbar.update(evaiter)
+        Y = X + U
+        # Pc1
+        x, _ = istft(Y, norm_envelope=norm_envelope)
 
-                if not init_loss:
-                    init_loss = l2_loss
-                elif (previous_loss - l2_loss) / init_loss < tol * evaiter and previous_loss > l2_loss:
-                    break
-                previous_loss = l2_loss
+        status_dict['Y'] = Y
+        status_dict['X'] = X
+        status_dict['U'] = U
+        status_dict['x'] = x
+        return output
 
-    return istft(X)
+    stats = {
+        'Y': Y,
+        'U': U,
+        'X': X,
+        'x': x
+    }
+
+    _training_loop(
+        closure,
+        stats,
+        target_spec,
+        max_iter,
+        tol,
+        verbose,
+        eva_iter,
+        metric
+    )
+
+    x = stats['x']
+    if not (spec.shape[0] == 1 and len(spec.shape) == 3):
+        x = x.squeeze(0)
+    return x
 
 
-def L_BFGS(spec, transform_fn, samples=None, init_x0=None, maxiter=1000, tol=1e-6, verbose=1, evaiter=10, metric='sc',
+def L_BFGS(spec, transform_fn, samples=None, init_x0=None, max_iter=1000, tol=1e-6, verbose=1, eva_iter=10, metric='sc',
            **kwargs):
     r"""
 
@@ -390,10 +524,10 @@ def L_BFGS(spec, transform_fn, samples=None, init_x0=None, maxiter=1000, tol=1e-
         samples (int, optional): number of samples in time domain. Default: :obj:`None`
         init_x0 (Tensor, optional): an 1d tensor that make use as initial time domain samples. If not provided, will use random
             value tensor with length equal to ``samples``.
-        maxiter (int): maximum number of iterations before timing out.
+        max_iter (int): maximum number of iterations before timing out.
         tol (float): tolerance of the stopping condition base on L2 loss. Default: ``1e-6``.
         verbose (bool): whether to be verbose. Default: :obj:`True`
-        evaiter (int): steps size for evaluation. After each step, the function defined in ``metric`` will evaluate. Default: ``10``
+        eva_iter (int): steps size for evaluation. After each step, the function defined in ``metric`` will evaluate. Default: ``10``
         metric (str): evaluation function. Currently available functions: ``'sc'`` (spectral convergence), ``'snr'`` or ``'ser'``. Default: ``'sc'``
         **kwargs: other arguments that pass to :class:`torch.optim.LBFGS`.
 
@@ -401,52 +535,36 @@ def L_BFGS(spec, transform_fn, samples=None, init_x0=None, maxiter=1000, tol=1e-
         A 1d tensor converted from the given presentation
     """
     if init_x0 is None:
-        init_x0 = spec.new_empty(samples).normal_(std=1e-6)
+        init_x0 = spec.new_empty(*samples).normal_(std=1e-6)
     x = nn.Parameter(init_x0)
     T = spec
 
     criterion = nn.MSELoss()
     optimizer = LBFGS([x], **kwargs)
 
-    def closure():
+    def inner_closure():
         optimizer.zero_grad()
         V = transform_fn(x)
         loss = criterion(V, T)
         loss.backward()
         return loss
 
-    bar_dict = {}
-    if metric == 'snr':
-        metric_func = SNR
-        bar_dict['SNR'] = 0
-        metric = metric.upper()
-    elif metric == 'ser':
-        metric_func = SER
-        bar_dict['SER'] = 0
-        metric = metric.upper()
-    else:
-        metric_func = spectral_convergence
-        bar_dict['spectral_convergence'] = 0
-        metric = 'spectral_convergence'
+    def outer_closure(status_dict):
+        optimizer.step(inner_closure)
+        with torch.no_grad():
+            V = transform_fn(x)
+        return V
 
-    init_loss = None
-    with tqdm(total=maxiter, disable=not verbose) as pbar:
-        for i in range(maxiter):
-            optimizer.step(closure)
-
-            if i % evaiter == evaiter - 1:
-                with torch.no_grad():
-                    V = transform_fn(x)
-                    bar_dict[metric] = metric_func(V, spec).item()
-                    l2_loss = criterion(V, spec).item()
-                    pbar.set_postfix(**bar_dict, loss=l2_loss)
-                    pbar.update(evaiter)
-
-                    if not init_loss:
-                        init_loss = l2_loss
-                    elif (previous_loss - l2_loss) / init_loss < tol * evaiter:
-                        break
-                    previous_loss = l2_loss
+    _training_loop(
+        outer_closure,
+        {},
+        T,
+        max_iter,
+        tol,
+        verbose,
+        eva_iter,
+        metric
+    )
 
     return x.detach()
 
@@ -459,34 +577,39 @@ def phase_init(spec, **stft_kwargs):
         https://ieeexplore.ieee.org/document/7251907
 
     Args:
-        spec (Tensor): the input tensor of size :math:`(N \times T)` (magnitude).
+        spec (Tensor): the input tensor of size :math:`(* \times N \times T)` (magnitude).
         **stft_kwargs: other arguments that pass to :func:`torch.stft`
 
     Returns:
         The estimated complex value spectrogram of size :math:`(N \times T \times 2)`
     """
-    n_fft, proccessed_args = _args_helper(spec, **stft_kwargs)
-    hop_length = proccessed_args['hop_length']
+    assert not spec.is_complex()
+    shape = spec.shape
+    if len(spec.shape) == 2:
+        spec = spec.unsqueeze(0)
+    assert len(spec.shape) == 3
+
+    n_fft, processed_args = _args_helper(spec, **stft_kwargs)
+    hop_length = processed_args['hop_length']
 
     phase = torch.zeros_like(spec)
 
-    def peak_picking(x):
-        mask = (x[1:-1] > x[2:]) & (x[1:-1] > x[:-2])
-        return F.pad(mask, [0, 0, 1, 1])
+    mask = (spec[:, 1:-1] > spec[:, 2:]) & (spec[:, 1:-1] > spec[:, :-2])
+    mask = F.pad(mask, [0, 0, 1, 1])
 
-    mask = peak_picking(spec)
     b = torch.masked_select(spec, mask)
-    a = torch.masked_select(spec[:-1], mask[1:])
-    r = torch.masked_select(spec[1:], mask[:-1])
-    b_peaks = torch.nonzero(mask).t()
+    a = torch.masked_select(spec[:, :-1], mask[:, 1:])
+    r = torch.masked_select(spec[:, 1:], mask[:, :-1])
+    idx1, idx2, idx3 = torch.nonzero(mask).t().unbind()
     p = 0.5 * (a - r) / (a - 2 * b + r)
-    omega = pi2 * (b_peaks[0].float() + p) / n_fft * hop_length
+    omega = pi2 * (idx2.float() + p) / n_fft * hop_length
 
-    idx1, idx2 = b_peaks.unbind()
-    phase[idx1, idx2] = omega
-    phase[idx1 - 1, idx2] = omega
-    phase[idx1 + 1, idx2] = omega
+    phase[idx1, idx2, idx3] = omega
+    phase[idx1, idx2 - 1, idx3] = omega
+    phase[idx1, idx2 + 1, idx3] = omega
 
-    phase = torch.cumsum(phase, 1, out=phase)
-    x = torch.stack((torch.cos(phase), torch.sin(phase)), 2) * spec.unsqueeze(2)
-    return x
+    phase = torch.cumsum(phase, 2)
+    angle = torch.exp(phase * 1j)
+
+    spec = spec * angle
+    return spec.view(shape)

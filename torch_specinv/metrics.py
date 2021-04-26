@@ -1,12 +1,12 @@
 import torch
 
 
-def spectral_convergence(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def sc(input, target):
     r"""
     The Spectral Convergence score is calculated as follow:
 
     .. math::
-        \mathcal{C}(\mathbf{\hat{S}}, \mathbf{S})=\frac{\|\mathbf{\hat{S}}_i-\mathbf{S}\|_{Fro}}{\|\mathbf{S}\|_{Fro}}
+        \mathcal{C}(\mathbf{\hat{S}}, \mathbf{S})=\frac{\|\mathbf{\hat{S}}-\mathbf{S}\|_{Fro}}{\|\mathbf{S}\|_{Fro}}
 
     Returns:
         scalar output in db scale.
@@ -14,7 +14,7 @@ def spectral_convergence(input: torch.Tensor, target: torch.Tensor) -> torch.Ten
     return 20 * ((input - target).norm().log10() - target.norm().log10())
 
 
-def SNR(input, target):
+def snr(input, target):
     r"""
     The Signal-to-Noise Ratio (SNR) is calculated as follow:
 
@@ -28,7 +28,7 @@ def SNR(input, target):
     return -10 * (input / input.norm() - target / target.norm()).pow(2).sum().log10()
 
 
-def SER(input, target):
+def ser(input, target):
     r"""
     The Signal-to-Error Ratio (SER) is calculated as follow:
 
