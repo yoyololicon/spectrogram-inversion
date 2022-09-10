@@ -506,7 +506,7 @@ def ADMM(spec, max_iter=1000, tol=1e-6, rho=0.1, verbose=1, eva_iter=10, metric=
     return x
 
 
-def L_BFGS(spec, transform_fn, samples=None, init_x0=None, max_iter=1000, tol=1e-6, verbose=1, eva_iter=10, metric='sc',
+def L_BFGS(spec, transform_fn, samples=None, init_x0=None, outer_max_iter=1000, tol=1e-6, verbose=1, eva_iter=10, metric='sc',
            **kwargs):
     r"""
 
@@ -524,7 +524,7 @@ def L_BFGS(spec, transform_fn, samples=None, init_x0=None, max_iter=1000, tol=1e
         samples (int, optional): number of samples in time domain. Default: :obj:`None`
         init_x0 (Tensor, optional): an 1d tensor that make use as initial time domain samples. If not provided, will use random
             value tensor with length equal to ``samples``.
-        max_iter (int): maximum number of iterations before timing out.
+        outer_max_iter (int): maximum number of iterations before timing out.
         tol (float): tolerance of the stopping condition base on L2 loss. Default: ``1e-6``.
         verbose (bool): whether to be verbose. Default: :obj:`True`
         eva_iter (int): steps size for evaluation. After each step, the function defined in ``metric`` will evaluate. Default: ``10``
@@ -559,7 +559,7 @@ def L_BFGS(spec, transform_fn, samples=None, init_x0=None, max_iter=1000, tol=1e
         outer_closure,
         {},
         T,
-        max_iter,
+        outer_max_iter,
         tol,
         verbose,
         eva_iter,
