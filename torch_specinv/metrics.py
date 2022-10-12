@@ -25,7 +25,8 @@ def snr(input, target):
     Returns:
         scalar output.
     """
-    return -10 * (input / input.norm() - target / target.norm()).pow(2).sum().log10()
+    norm = target.norm()
+    return -10 * (input / norm - target / norm).pow(2).sum().log10()
 
 
 def ser(input, target):
